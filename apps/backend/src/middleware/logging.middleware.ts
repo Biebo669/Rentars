@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { type Request, type Response, type NextFunction } from 'express';
 import { env } from '../config/env.js';
 import { getRequestContext, runWithRequestContext } from '../services/logging.service.js';
+import { redactLogFields, redactRequestHeaders } from '../utils/redact.js';
 
 // ── Log levels ────────────────────────────────────────────────────────────────
 
@@ -32,24 +33,58 @@ export interface LogEntry {
 }
 
 /**
+ * Well-known top-level schema keys that are safe to include verbatim.
+ * Every other key on a LogEntry is treated as an "extra" and passed through
+ * redactLogFields before serialisation so that a caller who accidentally
+ * includes a request body, provider response, or auth object cannot leak
+ * credentials into the log-aggregation pipeline.
+ */
+const SAFE_SCHEMA_KEYS = new Set([
+  'level', 'message', 'timestamp', 'requestId', 'userId',
+  'method', 'path', 'status', 'durationMs', 'ip',
+  'userAgent', 'route',
+]);
+
+/**
  * Emit a structured JSON log line.
+ *
  * In development the line is pretty-printed; in production it is a single-line
  * JSON object suitable for log-aggregation pipelines (Loki, CloudWatch, etc.).
  *
  * The log is suppressed when its level falls below the configured LOG_LEVEL.
+ *
+ * Before serialisation any field that is not in SAFE_SCHEMA_KEYS is passed
+ * through redactLogFields, ensuring credentials and PII in arbitrary extra
+ * fields are stripped before they reach the log sink.
  */
 export function structuredLog(entry: LogEntry): void {
   const configuredLevel = getConfiguredLevel();
   if (LEVEL_PRIORITY[entry.level] < LEVEL_PRIORITY[configuredLevel]) return;
 
   // Fall back to the AsyncLocalStorage-backed request context for any field
-  // the caller didn't set explicitly, so log calls made deep inside services
-  // (with no direct access to `req`) still carry the correlation id.
+  // the caller didn't set explicitly.
   const context = getRequestContext();
+
+  // Separate safe schema keys from arbitrary extras.
+  const safeFields: Record<string, unknown> = {};
+  const extraFields: Record<string, unknown> = {};
+
+  for (const [k, v] of Object.entries(entry)) {
+    if (SAFE_SCHEMA_KEYS.has(k)) {
+      safeFields[k] = v;
+    } else {
+      extraFields[k] = v;
+    }
+  }
+
+  // Redact extras in-place before merging into the final log line.
+  const redactedExtras = redactLogFields(extraFields) as Record<string, unknown>;
+
   const merged: LogEntry = {
-    ...entry,
-    requestId: entry.requestId ?? context?.requestId,
-    userId: entry.userId ?? context?.userId,
+    ...(safeFields as LogEntry),
+    requestId: (safeFields.requestId as string | undefined) ?? context?.requestId,
+    userId: (safeFields.userId as string | undefined) ?? context?.userId,
+    ...redactedExtras,
   };
 
   const line =
@@ -87,16 +122,9 @@ export function requestIdMiddleware(
       ? incomingId
       : randomUUID();
 
-  // Attach to the request object for downstream middleware and controllers
   (req as RequestWithId).requestId = requestId;
-
-  // Echo back so the client can correlate responses
   res.setHeader('X-Request-Id', requestId);
 
-  // Bind the correlation id (and method/path) to the async context for the
-  // rest of the request lifecycle, so any log call made further down the
-  // stack — controllers, services, blockchain/Supabase calls — can pick it
-  // up via `getRequestContext()` without `req` being passed around.
   runWithRequestContext({ requestId, method: req.method, path: req.path }, next);
 }
 
@@ -112,13 +140,14 @@ export interface RequestWithId extends Request {
 /**
  * Structured HTTP request/response logger.
  *
- * Emits a single structured log entry per request on response finish, containing:
- *   - ISO timestamp
- *   - Request-ID for correlation
- *   - HTTP method, normalised path, status code, duration
- *   - Authenticated user-ID (if present on req.userId)
+ * Emits one structured log entry per request on response finish. The
+ * `userAgent` and all request headers beyond the safe set are run through
+ * redactRequestHeaders so that Authorization or Cookie values set by an
+ * upstream proxy cannot appear in the access log.
  *
- * Paths matching SKIP_PATHS are not logged (e.g. /health, /metrics).
+ * Fields logged (all safe — no body, no raw headers):
+ *   timestamp, requestId, userId, method, path, status, durationMs, ip,
+ *   userAgent (from safe-header allowlist)
  */
 const SKIP_PATHS = new Set(['/health', '/metrics', '/favicon.ico']);
 
@@ -137,7 +166,14 @@ export function requestLoggingMiddleware(
 
   res.on('finish', () => {
     const duration = Date.now() - startMs;
-    const level: LogLevel = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    const level: LogLevel =
+      res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+
+    // Redact request headers so Authorization / Cookie can never appear in
+    // the access log even if they were forwarded by a misconfigured proxy.
+    const safeHeaders = redactRequestHeaders(
+      req.headers as Record<string, string | string[] | undefined>,
+    );
 
     structuredLog({
       level,
@@ -149,7 +185,8 @@ export function requestLoggingMiddleware(
       path: req.path,
       status: res.statusCode,
       durationMs: duration,
-      userAgent: req.headers['user-agent'],
+      // userAgent sourced from the already-redacted header map (safe field)
+      userAgent: safeHeaders['user-agent'] as string | undefined,
       ip: req.ip,
     });
   });
