@@ -12,6 +12,9 @@
  * When offline, stale cached content is marked and unsafe mutations are disabled.
  */
 
+// Version identifier. A build step may inject a concrete value by replacing the
+// fallback below (e.g. `const CACHE_VERSION = 'v1.2.3';`). When no injection
+// happens we fall back to a static version so the SW still works.
 const CACHE_VERSION = 'v1';
 const STATIC_CACHE = `rentars-static-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `rentars-runtime-${CACHE_VERSION}`;
@@ -20,7 +23,13 @@ const PUBLIC_PAGE_CACHE = `rentars-public-pages-${CACHE_VERSION}`;
 // Caches that may contain user-specific data and must be purged on logout/switch.
 const USER_CACHES = [RUNTIME_CACHE, PUBLIC_PAGE_CACHE];
 
+// When set (e.g. injected by a build), tells the page that an immediate reload
+// is required for compatibility with the backend. Empty string means no forced
+// reload is needed.
+const REQUIRED_MIN_VERSION = '';
+
 const STATIC_ASSETS = [
+  '/',
   '/offline.html',
   '/manifest.json',
 ];
@@ -52,17 +61,25 @@ const PRIVATE_PATH_PREFIXES = [
 // Install: pre-cache essential assets
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(STATIC_CACHE).then((cache) => cache.addAll(STATIC_ASSETS))
+    (async () => {
+      try {
+        const cache = await caches.open(STATIC_CACHE);
+        await cache.addAll(STATIC_ASSETS);
+      } catch (err) {
+        // Precache failed (e.g. flaky network). Abort the install so the
+        // previous working version and its caches are retained.
+        throw err;
+      }
+    })()
   );
-  // Activate immediately without waiting for old SW to become idle
-  self.skipWaiting();
 });
 
-// Activate: clean up old caches
+// Activate: clean up obsolete caches, then take control of clients.
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((cacheNames) =>
-      Promise.all(
+    (async () => {
+      const cacheNames = await caches.keys();
+      await Promise.all(
         cacheNames
           .filter(
             (name) =>
@@ -71,11 +88,33 @@ self.addEventListener('activate', (event) => {
               name !== PUBLIC_PAGE_CACHE
           )
           .map((name) => caches.delete(name))
-      )
-    )
+      );
+      await self.clients.claim();
+    })()
   );
-  // Take control of all clients immediately
-  self.clients.claim();
+});
+
+// Message handler: lets the page request activation (SKIP_WAITING) and query
+// the running version / compatibility requirements (GET_VERSION).
+self.addEventListener('message', (event) => {
+  const data = event.data || {};
+  if (data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+    return;
+  }
+  if (data.type === 'GET_VERSION') {
+    const reply = {
+      type: 'VERSION',
+      version: CACHE_VERSION,
+      requiredMinVersion: REQUIRED_MIN_VERSION,
+      forceReload: Boolean(REQUIRED_MIN_VERSION),
+    };
+    if (event.ports && event.ports[0]) {
+      event.ports[0].postMessage(reply);
+    } else if (event.source && event.source.postMessage) {
+      event.source.postMessage(reply);
+    }
+  }
 });
 
 // Message handling: purge user-specific caches on logout / account switch.

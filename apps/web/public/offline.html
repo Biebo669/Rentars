@@ -136,5 +136,46 @@
 
     <div class="badge">Rentars — Decentralized P2P Rentals on Stellar</div>
   </main>
+  <div class="update-banner" id="sw-update-banner" role="status" aria-live="polite">
+    <span>A new version of Rentars is available.</span>
+    <button class="btn" id="sw-update-reload" type="button">Reload</button>
+  </div>
+  <script>
+    (function () {
+      var banner = document.getElementById('sw-update-banner');
+      var reloadBtn = document.getElementById('sw-update-reload');
+      var reloadRequested = false;
+
+      function showBanner() {
+        if (banner) banner.classList.add('visible');
+      }
+
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.addEventListener('message', function (event) {
+          if (event.data && event.data.type === 'SW_UPDATE_AVAILABLE') {
+            showBanner();
+          }
+        });
+
+        navigator.serviceWorker.addEventListener('controllerchange', function () {
+          if (reloadRequested) {
+            window.location.reload();
+          }
+        });
+
+        if (reloadBtn) {
+          reloadBtn.addEventListener('click', function () {
+            var worker = navigator.serviceWorker.controller;
+            if (worker) {
+              reloadRequested = true;
+              worker.postMessage({ type: 'SKIP_WAITING' });
+            } else {
+              window.location.reload();
+            }
+          });
+        }
+      }
+    })();
+  </script>
 </body>
 </html>
