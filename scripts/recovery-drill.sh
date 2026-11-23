@@ -88,8 +88,10 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $(date -u +%H:%M:%S) $*" | tee -a "$LOG_F
 err()  { echo -e "${RED}[ERROR]${NC} $(date -u +%H:%M:%S) $*" | tee -a "$LOG_FILE"; }
 
 on_error() {
-  err "Drill failed at phase=${PHASE} step=${CURRENT_STEP:-unknown}"
+  local rc=$?
+  err "Drill failed at phase=${PHASE} step=${CURRENT_STEP:-unknown} (exit $rc)"
   RESULTS["${CURRENT_STEP:-unknown}"]="fail"
+  NOTES["${CURRENT_STEP:-unknown}"]="${NOTES[${CURRENT_STEP:-unknown}]:-}aborted at line ${BASH_LINENO[0]:-?} exit=$rc"
   write_report
   exit 1
 }
@@ -430,6 +432,9 @@ phase_cache_rebuild() {
   local ids
   ids=$(curl -sf "$STAGING_API_URL/properties?limit=10&sort=views" \
         | jq -r '.[].id // .properties[].id // empty' 2>>"$LOG_FILE" || true)
+  # Normalise to a newline-separated list so the hit-rate loop below can index
+  # it reliably (the previous `sed -n` indexing assumed one id per line).
+  ids="$(echo "$ids" | tr -s '[:space:]' '\n' | sed '/^$/d')"
   for id in $ids; do
     curl -sf "$STAGING_API_URL/properties/$id" -o /dev/null >>"$LOG_FILE" 2>&1 || true
   done
@@ -536,8 +541,8 @@ phase_sync_resume() {
   log "Sync resume completed in ${rto}s (target ${RTO_SYNC}s), converged=$converged, last_sync=$last_sync"
 
   if [ "$converged" -eq 1 ] && [ "$rto" -le "$RTO_SYNC" ] \
-     && [ "$sync_props_code" = "200" -o "$sync_props_code" = "202" ] \
-     && [ "$sync_book_code" = "200" -o "$sync_book_code" = "202" ]; then
+     && { [ "$sync_props_code" = "200" ] || [ "$sync_props_code" = "202" ]; } \
+     && { [ "$sync_book_code" = "200" ] || [ "$sync_book_code" = "202" ]; }; then
     RESULTS["sync_resume"]="pass"
     NOTES["sync_resume"]="rto=${rto}s age=${age}s sync_props=$sync_props_code sync_book=$sync_book_code"
   else
@@ -582,7 +587,7 @@ phase_core_reads() {
 
   check_read "health/deep" "$STAGING_API_URL/health/deep"
   check_read "properties?limit=20" "$STAGING_API_URL/properties?limit=20"
-  check_read "properties/<id>" "$STAGING_API_URL/properties?limit=1"
+  check_read "properties?limit=1" "$STAGING_API_URL/properties?limit=1"
   check_read "search?q=apartment" "$STAGING_API_URL/properties/search?q=apartment"
   check_read "bookings (auth)" "$STAGING_API_URL/api/v1/bookings?limit=1" "$ADMIN_JWT"
 
@@ -635,6 +640,9 @@ phase_booking_lookup() {
   while IFS=$'\t' read -r id property_id user_id db_status on_chain_id escrow_id; do
     [ -z "$id" ] && continue
     total=$((total + 1))
+    # escrow_id is read for parity with the DB projection but is not part of
+    # the agreement checks below; mark it used to satisfy shellcheck.
+    : "$escrow_id"
 
     # DB vs API agreement: the admin API must return this booking with the
     # same status. jq filters the API response by id.
@@ -665,7 +673,7 @@ phase_booking_lookup() {
     # (off-chain-only). A fresh on-chain lookup requires the sync route to
     # be mounted (see §7.2 follow-up risk).
     local chain_ok=1
-    if [ -n "$on_chain_id" ] && [ "$on_chain_id" != "" ]; then
+    if [ -n "$on_chain_id" ]; then
       local last_sync_status
       last_sync_status=$(db_query "SELECT status FROM sync_log WHERE entity_type='booking' AND entity_id='$on_chain_id' ORDER BY synced_at DESC LIMIT 1;" || echo "")
       if [ -n "$last_sync_status" ] && [ "$last_sync_status" != "success" ] && [ "$last_sync_status" != "$db_status" ]; then
@@ -723,7 +731,7 @@ phase_reconciliation() {
                 -H "Authorization: Bearer $ADMIN_JWT" \
                 | jq -r '.pending // "unknown"' 2>>"$LOG_FILE" || echo "unknown")
       log "  poll $i: pending=$pending"
-      [ "$pending" = "false" ] || [ "$pending" = "0" ] && break
+      if [ "$pending" = "false" ] || [ "$pending" = "0" ]; then break; fi
     done
   else
     warn "Reconcile trigger unavailable (HTTP $reconcile_code) — using DB-only discrepancy check."
@@ -768,7 +776,8 @@ phase_report() {
   CURRENT_STEP="report"
   log "=== Phase: report (§6.8) ==="
 
-  # Aggregate targets
+  # Aggregate targets. A phase that was never run (e.g. --phase report alone)
+  # must not be treated as a pass; require an explicit "pass" for each.
   local reads_ok="fail" lookup_recon_ok="fail"
   if [ "${RESULTS[db_restore]:-}" = "pass" ] \
      && [ "${RESULTS[cache_rebuild]:-}" = "pass" ] \

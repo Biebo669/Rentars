@@ -873,6 +873,32 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
 }
 
 /**
+ * GET /api/v1/bookings/:id/dispute/timeline
+ *
+ * Participant-safe dispute timeline. Distinguishes the recorded decision from
+ * the (possibly still pending or failed) financial settlement action, without
+ * exposing internal evidence or reviewer notes. (#943)
+ *
+ * Access: the booking tenant, the property host, or an admin/moderator.
+ */
+export async function getDisputeTimeline(req: Request, res: Response): Promise<void> {
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getDisputeTimelineForActor(req.params.id, actor);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 404).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
  * GET /api/v1/bookings/:id/refund-preview
  *
  * Shows the refund calculation from the booking-time policy snapshot *before*

@@ -688,10 +688,18 @@ and the reconcile trigger is not exposed). They are real, owned, and dated
 today; the first drill will confirm them as live failures and track them to
 closure. Retrospectives append further rows in the same format.
 
+Rows 3–6 were raised by the **2026-11-15 recovery drill, which FAILED**
+(issue #910). They must all be closed, with evidence linked in the Tracking
+link column, before #910 is closed.
+
 | # | Risk / gap | Source (step) | Owner (A) | Due date | Tracking link | Status |
 |---|---|---|---|---|---|---|
-| 1 | `sync.routes.ts` handlers exist but the router is not mounted in `apps/backend/src/routes/index.ts`; `reconcileAllPendingEscrows` is not exposed via HTTP; no `/sync/status` or `/sync/reconcile/status` or `/reconciliation/discrepancies` endpoint. Drill §6.4 and §6.7 cannot pass until routes are mounted and reconcile wired. | §6.4, §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| 1 | `sync.routes.ts` handlers exist but the router is not mounted in `apps/backend/src/routes/index.ts`; `reconcileAllPendingEscrows` is not exposed via HTTP; no `/sync/status` or `/sync/reconcile/status` or `/reconciliation/discrepancies` endpoint. Drill §6.4 and §6.7 cannot pass until routes are mounted and reconcile wired. **Confirmed live by the 2026-11-15 drill: §6.4 sync-resume returned 404 on both sync routes and the phase FAILED by design.** | §6.4, §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
 | 2 | Drill measures sync freshness via `sync_log` age, not direct ledger lag; on-chain lookup uses the last synced status rather than a fresh contract read. A `stellar-cli` query or read-only contract call should verify the live chain state. | §6.4, §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| 3 | **2026-11-15 drill failure — §6.7 reconciliation could not run a fresh reconcile.** Because `reconcileAllPendingEscrows` has no HTTP route (risk #1), the drill fell back to the DB-only discrepancy count and the Finance Owner's manual Trustless Work cross-check. The drill cannot prove a fresh reconcile run until the trigger endpoint exists; wire the route and re-run §6.7 in the next drill. | §6.7 | Backend On-Call | 2026-11-29 | (issue link) | Open |
+| 4 | **2026-11-15 drill failure — §6.6 booking-lookup on-chain agreement is unverified.** The phase compares against the last `sync_log` row rather than a fresh contract read, so a booking whose on-chain state changed after the last sync would pass incorrectly. Add a read-only contract call (or `stellar-cli` query) to §6.6 step 3 and record the result in the drill report. | §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| 5 | **2026-11-15 drill failure — §6.4 sync freshness proxy is too weak.** `sync_log` age < 120 s does not detect a stalled sync service that is writing rows without advancing against the ledger. Add a ledger-lag check (chain head vs. last synced ledger) to the drill runner and fail the phase when lag > 30 ledgers. | §6.4 | Infra Owner (RPC) | 2026-12-13 | (issue link) | Open |
+| 6 | **2026-11-15 drill failure — drill report sign-off incomplete.** The uploaded `recovery_drill_<ts>.json` artifact did not carry the §6.8 sign-off table (Actual / Pass-Fail / Owner columns blank), so the aggregate PASS/FAIL could not be audited from the artifact alone. Have the drill script emit the sign-off table into the JSON report and require the Incident Commander to fill it before upload. | §6.8 | Incident Commander | 2026-11-22 | (issue link) | Open |
 
 Retrospective-added rows are appended below the pre-identified rows, never
 above them, so the history of pre-identified gaps stays auditable.
@@ -728,6 +736,7 @@ with an owner and a due date before the issue is closed.
 
 | Date | Env | Commander | Result | Aggregate reads | Lookup+recon | Report |
 |---|---|---|---|---|---|---|
+| 2026-11-15 | staging | @handle | FAIL | __ min | __ min | `recovery_drill_*.json` (see #910) |
 | YYYY-MM-DD | staging | @handle | PASS/FAIL | __ min | __ min | `recovery_drill_*.json` |
 
 After each drill, append a row. The history is the evidence reviewed at launch

@@ -280,6 +280,77 @@ export interface Booking {
   rate_stale?: boolean;
 }
 
+// ─── Dispute timeline (participant-safe read model) ──────────────────────────
+
+/**
+ * Lifecycle stages of a dispute as exposed to participants.
+ *
+ * A recorded decision is deliberately distinct from the financial settlement
+ * that follows it: a refund or release may still be pending (or may fail)
+ * after the decision has been recorded.
+ */
+export type DisputeTimelineStage =
+  | 'opened'
+  | 'under_review'
+  | 'decision_recorded'
+  | 'settlement_pending'
+  | 'settlement_completed'
+  | 'settlement_failed';
+
+/** Financial action that a dispute decision may trigger. */
+export type DisputeFinancialAction = 'refund' | 'release' | 'none';
+
+/** Verified state of the financial action, sourced from the payment ledger. */
+export type DisputeSettlementStatus =
+  | 'not_required'
+  | 'pending'
+  | 'completed'
+  | 'failed';
+
+/** A single entry in the participant-safe dispute timeline. */
+export interface DisputeTimelineEvent {
+  id: string;
+  stage: DisputeTimelineStage;
+  /** ISO timestamp of when this transition occurred. */
+  occurred_at: string;
+  /** Participant-facing summary. Never contains internal evidence or reviewer notes. */
+  message?: string | null;
+  /** Financial action associated with this event, if any. */
+  financial_action?: DisputeFinancialAction;
+  /** Verified settlement status at the time of this event. */
+  settlement_status?: DisputeSettlementStatus;
+}
+
+/**
+ * Aggregated dispute timeline for a booking.
+ *
+ * `decision_recorded` reflects that a decision exists; it does NOT imply the
+ * refund/release has completed. Consumers must check `settlement_status`
+ * (and `settlement_completed_at`) before presenting the dispute as resolved.
+ */
+export interface DisputeTimeline {
+  booking_id: string;
+  dispute_id?: string;
+  /** Current authoritative stage, derived from decision history + payment state. */
+  current_stage: DisputeTimelineStage;
+  /** Whether a decision has been recorded (independent of settlement). */
+  decision_recorded: boolean;
+  /** ISO timestamp of the recorded decision, if any. */
+  decision_recorded_at?: string | null;
+  /** Financial action resulting from the decision, if any. */
+  financial_action: DisputeFinancialAction;
+  /** Verified settlement state from the payment ledger. */
+  settlement_status: DisputeSettlementStatus;
+  /** ISO timestamp when settlement was verified complete, if applicable. */
+  settlement_completed_at?: string | null;
+  /** ISO timestamp of the last settlement attempt (successful or not). */
+  settlement_last_attempt_at?: string | null;
+  /** Participant-safe failure reason when settlement_status is 'failed'. */
+  settlement_failure_reason?: string | null;
+  /** Ordered events, oldest first. */
+  events: DisputeTimelineEvent[];
+}
+
 export interface BookingFormData {
   checkIn: Date;
   checkOut: Date;
