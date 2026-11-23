@@ -1,5 +1,10 @@
 import { defineConfig, devices } from '@playwright/test';
 
+// Cross-browser coverage (firefox/webkit) is expensive and flaky-prone, so it
+// only runs in the scheduled matrix job (or when explicitly requested) rather
+// than on every pull request.
+const fullMatrix = !!process.env.PLAYWRIGHT_FULL_MATRIX;
+
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
@@ -11,7 +16,9 @@ export default defineConfig({
     : [['html', { open: 'on-failure' }]],
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:3001',
-    trace: 'on-first-retry',
+    // Capture diagnostics on failure so regressions can be diagnosed from CI
+    // artifacts alone.
+    trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
@@ -26,23 +33,32 @@ export default defineConfig({
     },
   },
   projects: [
+    // Required CI coverage: Chromium desktop + mobile viewports.
     {
-      name: 'chromium',
+      name: 'chromium-desktop',
       use: { ...devices['Desktop Chrome'] },
     },
     {
-      name: 'firefox',
-      use: { ...devices['Desktop Firefox'] },
-    },
-    {
-      name: 'webkit',
-      use: { ...devices['Desktop Safari'] },
-    },
-    // Mobile viewports for responsive testing
-    {
-      name: 'mobile-chrome',
+      name: 'chromium-mobile',
       use: { ...devices['Pixel 5'] },
     },
+    {
+      name: 'chromium-mobile-ios',
+      use: { ...devices['iPhone 13'] },
+    },
+    // Cross-browser coverage runs only in the scheduled matrix job.
+    ...(fullMatrix
+      ? [
+          {
+            name: 'firefox',
+            use: { ...devices['Desktop Firefox'] },
+          },
+          {
+            name: 'webkit',
+            use: { ...devices['Desktop Safari'] },
+          },
+        ]
+      : []),
   ],
   webServer: {
     command: process.env.CI ? 'yarn start' : 'yarn dev',

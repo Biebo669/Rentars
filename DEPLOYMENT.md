@@ -648,7 +648,117 @@ aws secretsmanager get-secret-value --secret-id prod/db/password | jq -r '.Secre
 
 ---
 
+## 7.10 Dependency Updates and Vulnerability Triage
+
+The backend (`apps/backend/package.json`), web (`apps/web/package.json`), and Rust
+contract (`apps/contracts/Cargo.toml`) manifests carry large, actively updated
+dependency sets. Updates must stay reproducible and must never be merged as blind
+major-version bumps.
+
+### 7.10.1 Update cadence
+
+| Cadence | Scope | Owner |
+|---|---|---|
+| Weekly (Monday) | Dependabot grouped patch/minor PRs for backend, web, and Rust crates | Backend/web maintainers |
+| Weekly (Monday) | Advisory scan results reviewed; new advisories triaged | Security on-call |
+| Monthly | Major/runtime-sensitive updates evaluated individually | Component owner + reviewer |
+| Quarterly | Exception register reviewed; expired exceptions closed | Security on-call |
+
+### 7.10.2 Automated advisory scanning
+
+Advisory scanning runs in CI and on a schedule:
+
+- **CI:** `.github/workflows/dependency-audit.yml` runs on every pull request that
+  touches a manifest or lockfile, and on a nightly schedule. It runs
+  `bun audit` (backend), `yarn npm audit` (web), and `cargo audit`
+  (contracts), and fails the job on any advisory at or above the configured
+  severity threshold.
+- **Dependabot:** `.github/dependabot.yml` opens grouped PRs for low-risk
+  patch/minor updates only. Major and runtime-sensitive packages (Next.js/React,
+  wallet SDKs, Supabase/PostgreSQL clients, and Rust contract crates) are
+  excluded from grouping and raised as individual PRs.
+
+Each finding must report the package name, installed version, patched version,
+advisory ID, and severity so it is actionable without leaving CI.
+
+### 7.10.3 Lockfile review expectations
+
+- Lockfiles (`bun.lockb`, `yarn.lock`, `Cargo.lock`) are committed and reviewed
+  in every dependency PR.
+- Reviewers confirm the lockfile diff only contains the intended packages and
+  their transitive additions/removals.
+- Installs in CI and deployment use frozen lockfiles; a lockfile that does not
+  match the manifest fails the build.
+
+### 7.10.4 Severity-based response process
+
+| Severity | Response window | Action |
+|---|---|---|
+| Critical | 24 hours | Patch or mitigate immediately; hotfix release |
+| High | 7 days | Patch in the next scheduled release |
+| Moderate | 30 days | Patch in a normal update cycle |
+| Low | Next quarterly review | Track and batch with routine updates |
+
+Every remediation PR must pass the relevant test suites before merge (see
+verification commands below). If a fix cannot be applied within the window, an
+exception must be recorded (see 7.10.6).
+
+### 7.10.5 Avoiding blind major-version upgrades
+
+Major and runtime-sensitive upgrades are never auto-merged. For each of the
+following, open a dedicated PR with a compatibility note and run the relevant
+suite:
+
+- **Framework (Next.js/React, Bun/Node runtime):** check release notes for
+  breaking changes, run `apps/web` build and `apps/backend` contract tests.
+- **Wallet SDKs (Stellar/Freighter/passkey):** verify connect, sign, and submit
+  flows against testnet before merge.
+- **Database clients (Supabase/PostgreSQL):** confirm migration compatibility and
+  run the `rls-tests` job.
+- **Rust contract crates (soroban-sdk and friends):** rebuild WASM, run
+  `cargo test`, and re-verify contract ABI and cross-contract calls.
+
+### 7.10.6 Verification commands
+
+```bash
+# Backend: frozen install, audit, and tests
+cd apps/backend
+bun install --frozen-lockfile
+bun audit
+bun run test
+
+# Web: frozen install, audit, and build
+cd apps/web
+yarn install --frozen-lockfile
+yarn npm audit --severity high
+yarn build
+
+# Contracts: audit, tests, and WASM build
+cd apps/contracts
+cargo audit
+cargo test
+cargo build --target wasm32-unknown-unknown --release
+```
+
+### 7.10.7 Exception process
+
+When a vulnerability cannot be remediated within its response window:
+
+1. Record the exception in `docs/security/dependency-exceptions.md` with the
+   package, advisory ID, severity, reason, compensating control, owner, and an
+   **expiration date** (no more than 90 days out).
+2. Reference the exception in the PR or issue that tracks the finding.
+3. Suppress the advisory in the scanner only with a matching, dated ignore entry
+   so it is visible in review.
+4. Review all open exceptions at the quarterly review; expired exceptions must be
+   remediated or re-justified with a new expiration date.
+
+Exceptions are documented and reviewed — never silently ignored.
+
+---
+
 ## 8. Monitoring and Alerting
+=======
 
 ### 8.1 Release State Tracking
 
@@ -788,7 +898,77 @@ Set alerts for health gates:
 
 ---
 
+## 8.8 Backup Verification and Restore Drills
+
+A backup that has never been restored is not a verified recovery mechanism.
+Rental and payment history require explicit recovery objectives.
+
+### 8.8.1 Recovery objectives
+
+| Target | Value | Owner |
+|---|---|---|
+| RPO (database) | 15 minutes (point-in-time recovery) | Database owner |
+| RTO (database) | 2 hours to a verified, isolated restore | On-call + database owner |
+| RPO (object storage) | 24 hours | Infrastructure lead |
+| RTO (object storage) | 4 hours | Infrastructure lead |
+| RPO (configuration/secrets) | On change (versioned) | Security on-call |
+| RTO (configuration) | 1 hour | On-call |
+
+### 8.8.2 Backup sources and retention
+
+- **Database:** Supabase automated backups / PostgreSQL base backups plus WAL for
+  point-in-time recovery. Retain daily backups for 30 days and weekly for 90 days.
+- **Object storage:** versioned bucket with lifecycle rules; retain 30 days.
+- **Configuration:** environment variables and secrets live in the secrets
+  manager with version history; never copied into developer environments.
+
+### 8.8.3 Automated backup validation
+
+Where the platform supports it, schedule a validation job that confirms the most
+recent backup exists, is non-zero, and passes a checksum. Failures alert the
+on-call engineer.
+
+### 8.8.4 Restore drill procedure (isolated, sanitized)
+
+1. Provision an isolated database and storage bucket that is not reachable from
+   production.
+2. Restore the most recent backup into the isolated database.
+3. Do **not** copy production secrets. Use throwaway credentials for the drill
+   environment only.
+4. Verify migration compatibility: confirm the restored schema version matches
+   the expected migration and that `setup.sql` is idempotent against it.
+5. Run key integrity queries to confirm core booking/payment relationships:
+
+```sql
+-- Bookings reference existing properties and users
+SELECT count(*) FROM bookings b
+  LEFT JOIN properties p ON p.id = b.property_id
+  WHERE p.id IS NULL;
+
+-- Payments reference existing bookings
+SELECT count(*) FROM payments pay
+  LEFT JOIN bookings b ON b.id = pay.booking_id
+  WHERE b.id IS NULL;
+
+-- No orphaned rental history
+SELECT count(*) FROM bookings WHERE status IS NULL;
+```
+
+All counts must be zero (or match the documented baseline) before the drill is
+considered successful.
+
+### 8.8.5 Drill schedule and evidence
+
+- Restore drills run **quarterly**, and after any major schema or infrastructure
+  change.
+- Record the drill date, backup timestamp restored, duration, verification query
+  results, and any remediation actions in the operational runbook/issue tracker.
+- Failed drills produce a remediation action with an owner and due date.
+
+---
+
 ## 9. Validation Steps
+=======
 
 To confirm deployments are production-ready, verify:
 
@@ -803,5 +983,10 @@ To confirm deployments are production-ready, verify:
 9. ✅ Health gates monitoring configured in observability platform
 10. ✅ Rollback approval process requires 2 approvers for production
 11. ✅ No commands expose signing secrets in logs or CLI arguments
+12. ✅ Dependency advisory scanning runs in CI and on schedule with actionable package/severity output
+13. ✅ Major/runtime-sensitive upgrades are reviewed individually, not auto-merged
+14. ✅ Dependency exceptions are documented with expiration dates and reviewed quarterly
+15. ✅ RPO/RTO targets and owners are documented for database, storage, and configuration
+16. ✅ A restore drill into an isolated, sanitized environment has been completed and recorded
 
 If all checks are satisfied, deployment automation is production-ready.
