@@ -6,6 +6,7 @@ import { Plus } from 'lucide-react';
 import { useHostDashboard } from '@/hooks/useHostDashboard';
 import DashboardSummaryCards from '@/components/dashboard/DashboardSummaryCards';
 import HostPropertiesTable from '@/components/dashboard/HostPropertiesTable';
+import { useBookingActionPolicy } from '@/lib/bookings/useBookingActionPolicy';
 import {
   DashboardSummarySkeleton,
   EmptyState,
@@ -40,6 +41,11 @@ export default function HostDashboard() {
     refetchProperties,
     updatePropertyStatus,
   } = useHostDashboard();
+
+  // Derive host-role booking action availability from the shared action
+  // matrix so the same booking state yields the same actions as tenant views.
+  // Backend services remain authoritative for authorization.
+  const { getActionsForBooking, getUnavailableReason } = useBookingActionPolicy('host');
 
   const handleAddProperty = () => {
     setShowAddProperty(false);
@@ -168,6 +174,8 @@ export default function HostDashboard() {
             <HostPropertiesTable
               properties={properties}
               onStatusChange={updatePropertyStatus}
+              getBookingActions={getActionsForBooking}
+              getBookingUnavailableReason={getUnavailableReason}
             />
           )}
         </section>

@@ -3,6 +3,7 @@
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useDashboard, type BookingStatus, type BookingSort, type BookingOrder } from '@/hooks/useDashboard';
 import BookingHistory from '@/components/dashboard/BookingHistory';
+import { getBookingActions, type BookingActionContext } from '@/lib/bookingActionMatrix';
 import Analytics from '@/components/dashboard/Analytics';
 import NotificationSystem from '@/components/dashboard/NotificationSystem';
 import { BookingListSkeleton, ErrorState, SkeletonRegion } from '@/components/ui';
@@ -47,23 +48,37 @@ export default function TenantDashboard() {
     },
   ];
 
-  const formattedBookings = bookings.map((booking) => ({
-    id: booking.id,
-    propertyTitle: 'Property Name',
-    location: 'City, State',
-    checkIn: new Date(booking.check_in),
-    checkOut: new Date(booking.check_out),
-    totalPrice: booking.total_price,
-    status: booking.status.toLowerCase() as
+  const formattedBookings = bookings.map((booking) => {
+    const status = booking.status.toLowerCase() as
       | 'pending'
       | 'confirmed'
       | 'completed'
       | 'cancelled'
-      | 'escrow_reconcile_failed',
-    escrowStatus: booking.status.toLowerCase() === 'escrow_reconcile_failed'
-      ? 'manual_review'
-      : booking.escrow_status,
-  }));
+      | 'escrow_reconcile_failed';
+    const escrowStatus =
+      status === 'escrow_reconcile_failed' ? 'manual_review' : booking.escrow_status;
+
+    // Action availability comes from the shared matrix so every surface
+    // (cards, detail pages, action components) agrees for the same state.
+    // Authorization stays in the backend; this is presentation only.
+    const actionContext: BookingActionContext = {
+      role: 'tenant',
+      status,
+      escrowStatus,
+    };
+
+    return {
+      id: booking.id,
+      propertyTitle: 'Property Name',
+      location: 'City, State',
+      checkIn: new Date(booking.check_in),
+      checkOut: new Date(booking.check_out),
+      totalPrice: booking.total_price,
+      status,
+      escrowStatus,
+      actions: getBookingActions(actionContext),
+    };
+  });
 
   return (
     <main className="min-h-screen bg-gray-50 py-8">

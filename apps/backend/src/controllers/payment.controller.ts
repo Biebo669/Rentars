@@ -14,12 +14,14 @@
  */
 
 import type { Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import {
   createPaymentIntent,
   getPaymentStatus,
   updatePaymentStatus,
+  getDerivedPaymentStatus,
 } from '@/services/payment.service.js';
 import {
   submitTransaction,
@@ -36,6 +38,55 @@ import {
   type SupportedCurrency,
 } from '@/utils/payment.utils.js';
 import { supabase } from '@/config/supabase.js';
+
+// ─── Correlation & redaction helpers ───────────────────────────────────────────
+
+const SENSITIVE_KEY_PATTERN =
+  /(secret|token|password|passwd|private[_-]?key|seed|mnemonic|authorization|api[_-]?key|credential|xdr)/i;
+
+/**
+ * Returns a correlation id for the current request, reusing an inbound
+ * `x-correlation-id` / `x-request-id` header when present so a single payment
+ * flow can be traced across controller, service, and provider calls.
+ */
+function getCorrelationId(req: AuthRequest): string {
+  const headerValue = req.headers?.['x-correlation-id'] ?? req.headers?.['x-request-id'];
+  const candidate = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  if (typeof candidate === 'string' && candidate.trim().length > 0 && candidate.length <= 128) {
+    return candidate.trim();
+  }
+  return randomUUID();
+}
+
+/**
+ * Recursively redacts credential-like fields from a value before it is logged
+ * or returned to a client. Never mutates the input.
+ */
+function redactCredentials<T>(value: T, depth = 0): T {
+  if (depth > 8 || value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactCredentials(item, depth + 1)) as unknown as T;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = SENSITIVE_KEY_PATTERN.test(key) ? '[REDACTED]' : redactCredentials(entry, depth + 1);
+  }
+  return out as T;
+}
+
+/**
+ * Logs an error with correlation context, redacting any credential-like data
+ * that may have been attached to the error object.
+ */
+function logPaymentError(correlationId: string, message: string, err: unknown): void {
+  const detail =
+    err instanceof Error
+      ? { name: err.name, message: err.message, stack: err.stack }
+      : redactCredentials(err);
+  console.error(`[Payment][correlationId=${correlationId}] ${message}`, redactCredentials(detail));
+}
 
 // ─── Quote generation ──────────────────────────────────────────────────────────
 
@@ -165,6 +216,8 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
 
   const { bookingId, signedXdr, amountStroops, currency, quoteHash, expiresAt, metadata } = parsed.data;
   const tenantId = req.userId!;
+  const correlationId = getCorrelationId(req);
+  res.setHeader('x-correlation-id', correlationId);
 
   // ── 1. Validate amount and currency (#768) ──────────────────────────────────
   const errors = validatePaymentAmount(amountStroops, currency);
@@ -251,39 +304,52 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
   }
 
   // ── 3. Create payment intent in 'pending' state ─────────────────────────────
+  // The idempotency key is derived from the signed quote so duplicate submits
+  // of the same quote resolve to the same ledger entry.
+  const idempotencyKey = quoteHash;
   const payment = await createPaymentIntent({
     bookingId,
     tenantId,
     amountStroops: stroops,
     quoteHash,
+    idempotencyKey,
+    correlationId,
     metadata,
   });
 
   // ── 4. Submit signed XDR to Stellar ─────────────────────────────────────────
   let txHash: string;
   try {
-    const result = await submitTransaction(signedXdr);
+    const result = await submitTransaction(signedXdr, { correlationId, paymentId: payment.id });
     txHash = result.txHash;
-    await updatePaymentStatus(payment.id, txHash, 'submitted');
+    await updatePaymentStatus(payment.id, txHash, 'submitted', { correlationId });
     await recordSuccess('stellar_horizon');
   } catch (err) {
-    await updatePaymentStatus(payment.id, null, 'failed');
+    await updatePaymentStatus(payment.id, null, 'failed', { correlationId });
     await recordFailure('stellar_horizon');
+    logPaymentError(correlationId, `Transaction submission failed for payment ${payment.id}`, err);
     res.status(502).json({
       error: {
         code: 'TX_SUBMIT_FAILED',
         message: err instanceof Error ? err.message : 'Transaction submission failed',
+        correlationId,
       },
     });
     return;
   }
 
   // ── 5. Kick off async confirmation polling (does not block the response) ───
-  confirmTransaction(payment.id, txHash).catch((err) => {
-    console.error('[Payment] Confirmation polling failed for', payment.id, err);
+  confirmTransaction(payment.id, txHash, { correlationId }).catch((err) => {
+    logPaymentError(correlationId, `Confirmation polling failed for payment ${payment.id}`, err);
   });
 
-  res.status(202).json({ paymentId: payment.id, status: 'submitted', txHash });
+  res.status(202).json({
+    paymentId: payment.id,
+    status: 'submitted',
+    txHash,
+    correlationId,
+    idempotencyKey,
+  });
 }
 
 // ─── Status polling ────────────────────────────────────────────────────────────
@@ -315,10 +381,21 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
 
   const breakdown = buildAmountBreakdown(payment.amount_stroops, payment.currency);
 
+  // The derived status is reproducible from the stored payment events; fall
+  // back to the persisted status only if the ledger cannot be read.
+  let derivedStatus = payment.status;
+  try {
+    const derived = await getDerivedPaymentStatus(payment.id);
+    if (derived) derivedStatus = derived;
+  } catch (err) {
+    logPaymentError(getCorrelationId(req), `Failed to derive ledger status for payment ${payment.id}`, err);
+  }
+
   res.json({
     paymentId: payment.id,
     bookingId: payment.booking_id,
-    status: payment.status,
+    status: derivedStatus,
+    persistedStatus: payment.status,
     txHash: payment.stellar_tx_hash,
     amountStroops: payment.amount_stroops.toString(),
     amountDisplay: breakdown.amountDisplay,
@@ -377,6 +454,8 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
   }
 
   const tenantId = req.userId!;
+  const correlationId = getCorrelationId(req);
+  res.setHeader('x-correlation-id', correlationId);
 
   // ── Attempt limiter ────────────────────────────────────────────────────────
   const attemptResult = await checkAndIncrementAttempts(payment.booking_id, tenantId);
@@ -409,13 +488,20 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
   }
 
   try {
-    const result = await retryTransaction(id, parsed.data.signedXdr);
-    res.json({ paymentId: id, txHash: result.txHash, status: result.status });
+    const result = await retryTransaction(id, parsed.data.signedXdr, { correlationId });
+    res.json({
+      paymentId: id,
+      txHash: result.txHash,
+      status: result.status,
+      correlationId,
+    });
   } catch (err) {
+    logPaymentError(correlationId, `Retry failed for payment ${id}`, err);
     res.status(422).json({
       error: {
         code: 'RETRY_FAILED',
         message: err instanceof Error ? err.message : 'Retry failed',
+        correlationId,
       },
     });
   }

@@ -20,7 +20,7 @@
  * information leakage.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { supabase } from '@/config/supabase.js';
 import { usdcToStroops } from '@/utils/payment.utils.js';
@@ -29,6 +29,8 @@ import {
   mapProviderStatus,
   hashEventPayload,
   getPaymentByBookingId,
+  appendPaymentEvent,
+  derivePaymentStatus,
 } from './payment.service.js';
 import type { ServiceResponse } from './index.js';
 
@@ -126,21 +128,77 @@ async function isReplay(eventId: string): Promise<boolean> {
 
 /**
  * Persist an event ID to the replay ledger.
+ *
+ * Idempotent: a duplicate insert (same event_id) is ignored via upsert so
+ * concurrent deliveries of the same callback cannot create duplicate rows or
+ * financial effects. Returns true when the event was newly recorded.
  */
 async function recordEvent(
   eventId: string,
   bookingId: string,
   eventHash: string,
-): Promise<void> {
-  await supabase
+): Promise<boolean> {
+  const { data, error } = await supabase
     .from('payment_callback_events')
-    .insert({
-      event_id: eventId,
-      booking_id: bookingId,
-      event_hash: eventHash,
-      created_at: new Date().toISOString(),
-    })
-    .select(); // fire-and-forget but await to avoid unhandled rejections
+    .upsert(
+      {
+        event_id: eventId,
+        booking_id: bookingId,
+        event_hash: eventHash,
+        created_at: new Date().toISOString(),
+      },
+      { onConflict: 'event_id', ignoreDuplicates: true },
+    )
+    .select('id');
+
+  if (error) {
+    console.error(`[Callback] Failed to record replay ledger entry for eventId=${eventId}:`, error.message);
+    return false;
+  }
+  return Array.isArray(data) && data.length > 0;
+}
+
+/**
+ * Append a validated payment event to the canonical ledger.
+ *
+ * The ledger is append-only; the derived payment status is recomputed from
+ * the stored events. Duplicate events (same idempotency key) are ignored so
+ * they cannot create duplicate financial effects. Out-of-order events are
+ * accepted — the derived status is order-independent.
+ */
+async function appendLedgerEvent(params: {
+  paymentId: string;
+  bookingId: string;
+  providerAccountId: string;
+  eventId: string;
+  eventHash: string;
+  canonicalStatus: string;
+  amountStroops: bigint;
+  txHash: string | null;
+  correlationId: string;
+  rawPayload: Record<string, unknown>;
+}): Promise<void> {
+  const result = await appendPaymentEvent({
+    paymentId: params.paymentId,
+    bookingId: params.bookingId,
+    provider: params.providerAccountId,
+    network: 'stellar',
+    amountStroops: params.amountStroops,
+    idempotencyKey: params.eventId,
+    eventHash: params.eventHash,
+    status: params.canonicalStatus,
+    txHash: params.txHash,
+    correlationId: params.correlationId,
+    payload: params.rawPayload,
+  });
+
+  if (!result.success) {
+    console.error(
+      `[Callback] Failed to append ledger event for payment=${params.paymentId} ` +
+      `correlationId=${params.correlationId}:`,
+      result.error,
+    );
+  }
 }
 
 // ─── Main verifier ────────────────────────────────────────────────────────────
@@ -196,6 +254,10 @@ export async function verifyAndProcessCallback(
 
   const body = parseResult.data;
 
+  // Correlation identifier threaded through every external call and log line
+  // for this callback so support can trace a single delivery end-to-end.
+  const correlationId = randomUUID();
+
   // ── 4. Clock skew check ───────────────────────────────────────────────────
   const eventAge = Date.now() - new Date(body.timestamp).getTime();
   if (Math.abs(eventAge) > MAX_CLOCK_SKEW_MS) {
@@ -210,7 +272,8 @@ export async function verifyAndProcessCallback(
   if (body.providerAccountId !== expectedProviderId) {
     // Potential cross-tenant injection; quarantine
     console.error(
-      `[Callback] Provider account mismatch: got=${body.providerAccountId} expected=${expectedProviderId}`,
+      `[Callback] Provider account mismatch correlationId=${correlationId}: ` +
+      `got=${body.providerAccountId} expected=${expectedProviderId}`,
     );
     return {
       status: 'mismatch',
@@ -234,8 +297,13 @@ export async function verifyAndProcessCallback(
   const payment = await getPaymentByBookingId(body.bookingId);
 
   if (!payment) {
-    // Booking not found — could be a test event or mis-routed webhook
-    console.warn(`[Callback] No payment found for bookingId=${body.bookingId}`);
+    // Booking not found — could be a test event or mis-routed webhook.
+    // Quarantine: record the event so support can reconcile the missing
+    // provider callback against the booking, without touching financial state.
+    console.warn(
+      `[Callback] No payment found for bookingId=${body.bookingId} correlationId=${correlationId}`,
+    );
+    await recordEvent(body.eventId, body.bookingId, eventHash);
     return {
       status: 'mismatch',
       httpStatus: 422,
@@ -251,7 +319,11 @@ export async function verifyAndProcessCallback(
     .single();
 
   if (bookingError) {
-    console.error(`[Callback] Failed to verify booking amount for ${body.bookingId}:`, bookingError.message);
+    console.error(
+      `[Callback] Failed to verify booking amount for ${body.bookingId} ` +
+      `correlationId=${correlationId}:`,
+      bookingError.message,
+    );
     return {
       status: 'quarantined',
       httpStatus: 503,
@@ -276,10 +348,24 @@ export async function verifyAndProcessCallback(
   ) {
     // Amount mismatch — quarantine; do NOT mark paid
     console.error(
-      `[Callback] Amount mismatch or booking lookup failure for bookingId=${body.bookingId}: ` +
+      `[Callback] Amount mismatch or booking lookup failure for bookingId=${body.bookingId} ` +
+      `correlationId=${correlationId}: ` +
       `provider=${incomingStroops} payment=${payment.amount_stroops} ` +
       `booking=${bookingAmountStroops ?? 'unavailable'}`,
     );
+    // Append the mismatched event to the ledger (append-only, idempotent)
+    await appendLedgerEvent({
+      paymentId: payment.id,
+      bookingId: body.bookingId,
+      providerAccountId: body.providerAccountId,
+      eventId: body.eventId,
+      eventHash,
+      canonicalStatus: 'under_review',
+      amountStroops: incomingStroops,
+      txHash: body.txHash ?? null,
+      correlationId,
+      rawPayload: { ...body, _reason: 'amount_mismatch' } as unknown as Record<string, unknown>,
+    });
     // Transition to under_review so the discrepancy is auditable
     await transitionPaymentStatus(
       payment.id,
@@ -287,6 +373,7 @@ export async function verifyAndProcessCallback(
       {
         ...body,
         _reason: 'amount_mismatch',
+        _correlationId: correlationId,
       } as unknown as Record<string, unknown>,
     );
     // Record in replay ledger to avoid re-processing
@@ -298,13 +385,40 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  // ── 8. Map provider status and apply transition ───────────────────────────
+  // ── 8. Map provider status and append to the canonical ledger ─────────────
   const canonicalStatus = mapProviderStatus(body.status);
+
+  // Append the validated event first. The ledger is append-only and idempotent
+  // on eventId, so duplicate deliveries cannot create duplicate effects.
+  await appendLedgerEvent({
+    paymentId: payment.id,
+    bookingId: body.bookingId,
+    providerAccountId: body.providerAccountId,
+    eventId: body.eventId,
+    eventHash,
+    canonicalStatus,
+    amountStroops: incomingStroops,
+    txHash: body.txHash ?? null,
+    correlationId,
+    rawPayload: body as unknown as Record<string, unknown>,
+  });
+
+  // Recompute the derived status from stored events (order-independent).
+  const derived = await derivePaymentStatus(payment.id);
+  if (!derived.success) {
+    console.error(
+      `[Callback] Failed to derive status for payment=${payment.id} correlationId=${correlationId}:`,
+      derived.error,
+    );
+  }
 
   const transitionResult = await transitionPaymentStatus(
     payment.id,
     canonicalStatus,
-    body as unknown as Record<string, unknown>,
+    {
+      ...body,
+      _correlationId: correlationId,
+    } as unknown as Record<string, unknown>,
     body.txHash ?? null,
   );
 
@@ -312,7 +426,10 @@ export async function verifyAndProcessCallback(
   await recordEvent(body.eventId, body.bookingId, eventHash);
 
   if (!transitionResult.success) {
-    console.error(`[Callback] Transition failed for payment=${payment.id}:`, transitionResult.error);
+    console.error(
+      `[Callback] Transition failed for payment=${payment.id} correlationId=${correlationId}:`,
+      transitionResult.error,
+    );
     // Still return 200 to the provider (we received it fine; our internal
     // state diverged, which is a separate alert path).
     return {
@@ -324,7 +441,9 @@ export async function verifyAndProcessCallback(
 
   const transition = transitionResult.data;
   if (!transition) {
-    console.error(`[Callback] Transition returned no data for payment=${payment.id}`);
+    console.error(
+      `[Callback] Transition returned no data for payment=${payment.id} correlationId=${correlationId}`,
+    );
     return {
       status: 'quarantined',
       httpStatus: 200,
