@@ -20,7 +20,7 @@
  * information leakage.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { supabase } from '@/config/supabase.js';
 import { usdcToStroops } from '@/utils/payment.utils.js';
@@ -29,6 +29,8 @@ import {
   mapProviderStatus,
   hashEventPayload,
   getPaymentByBookingId,
+  appendPaymentEvent,
+  derivePaymentStatus,
 } from './payment.service.js';
 import {
   reconcileEscrowOperation,
@@ -175,6 +177,10 @@ async function isReplay(eventId: string): Promise<boolean> {
 
 /**
  * Persist an event ID to the replay ledger.
+ *
+ * Idempotent: a duplicate insert (same event_id) is ignored via upsert so
+ * concurrent deliveries of the same callback cannot create duplicate rows or
+ * financial effects. Returns true when the event was newly recorded.
  */
 async function recordEvent(
   eventId: string,
@@ -404,6 +410,7 @@ export async function verifyAndProcessCallback(
       {
         ...body,
         _reason: 'amount_mismatch',
+        _correlationId: correlationId,
       } as unknown as Record<string, unknown>,
     );
     // Record in replay ledger to avoid re-processing
@@ -415,13 +422,40 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  // ── 8. Map provider status and apply transition ───────────────────────────
+  // ── 8. Map provider status and append to the canonical ledger ─────────────
   const canonicalStatus = mapProviderStatus(body.status);
+
+  // Append the validated event first. The ledger is append-only and idempotent
+  // on eventId, so duplicate deliveries cannot create duplicate effects.
+  await appendLedgerEvent({
+    paymentId: payment.id,
+    bookingId: body.bookingId,
+    providerAccountId: body.providerAccountId,
+    eventId: body.eventId,
+    eventHash,
+    canonicalStatus,
+    amountStroops: incomingStroops,
+    txHash: body.txHash ?? null,
+    correlationId,
+    rawPayload: body as unknown as Record<string, unknown>,
+  });
+
+  // Recompute the derived status from stored events (order-independent).
+  const derived = await derivePaymentStatus(payment.id);
+  if (!derived.success) {
+    console.error(
+      `[Callback] Failed to derive status for payment=${payment.id} correlationId=${correlationId}:`,
+      derived.error,
+    );
+  }
 
   const transitionResult = await transitionPaymentStatus(
     payment.id,
     canonicalStatus,
-    body as unknown as Record<string, unknown>,
+    {
+      ...body,
+      _correlationId: correlationId,
+    } as unknown as Record<string, unknown>,
     body.txHash ?? null,
   );
 
