@@ -28,6 +28,13 @@ export const CITY_MAX = 100;
 export const COUNTRY_MAX = 100;
 export const LAT_RANGE: [number, number] = [-90, 90];
 export const LNG_RANGE: [number, number] = [-180, 180];
+/**
+ * Guest capacity bounds. Mirrors the backend constants (MAX_GUESTS_MIN / MAX_GUESTS_MAX in
+ * property.validator.ts) and the database CHECK constraint on listings.max_guests, so the
+ * form, search filters, quotes and booking creation all agree on the valid range.
+ */
+export const MAX_GUESTS_MIN = 1;
+export const MAX_GUESTS_MAX = 50;
 
 /** Canonical amenity ids accepted by the API (apps/backend/src/types/amenities.ts). */
 export const AMENITY_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
@@ -117,7 +124,11 @@ const STEP_RULES: Record<ListingStep, (d: Partial<ListingFormData>, e: FormError
     if (!d.propertyType || !(PROPERTY_TYPES as readonly string[]).includes(d.propertyType)) {
       e.propertyType = 'Choose a property type';
     }
-    if (!isWhole(d.maxGuests) || d.maxGuests < 1) e.maxGuests = 'At least 1 guest is required';
+    if (!isWhole(d.maxGuests) || d.maxGuests < MAX_GUESTS_MIN) {
+      e.maxGuests = `At least ${MAX_GUESTS_MIN} guest is required`;
+    } else if (d.maxGuests > MAX_GUESTS_MAX) {
+      e.maxGuests = `At most ${MAX_GUESTS_MAX} guests are allowed`;
+    }
     if (!isWhole(d.bedrooms) || d.bedrooms < 0) e.bedrooms = 'Bedrooms must be 0 or more';
     if (!isWhole(d.bathrooms) || d.bathrooms < 0) e.bathrooms = 'Bathrooms must be 0 or more';
   },

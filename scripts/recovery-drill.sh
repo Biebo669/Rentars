@@ -67,8 +67,10 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $(date -u +%H:%M:%S) $*" | tee -a "$LOG_F
 err()  { echo -e "${RED}[ERROR]${NC} $(date -u +%H:%M:%S) $*" | tee -a "$LOG_FILE"; }
 
 on_error() {
-  err "Drill failed at phase=${PHASE} step=${CURRENT_STEP:-unknown}"
+  local rc=$?
+  err "Drill failed at phase=${PHASE} step=${CURRENT_STEP:-unknown} (exit $rc)"
   RESULTS["${CURRENT_STEP:-unknown}"]="fail"
+  NOTES["${CURRENT_STEP:-unknown}"]="${NOTES[${CURRENT_STEP:-unknown}]:-}aborted at line ${BASH_LINENO[0]:-?} exit=$rc"
   write_report
   exit 1
 }
@@ -116,7 +118,11 @@ require_env() {
 
 require_env STAGING_API_URL ADMIN_JWT
 
-REDIS_HOST="${REDIS_HOST:-$(echo "$REDIS_URL" | sed -E 's#redis://([^:@/]+).*#\1#' 2>/dev/null || true)}"
+# REDIS_URL may be unset (set -u); guard the expansion before parsing it.
+if [ -z "${REDIS_HOST:-}" ] && [ -n "${REDIS_URL:-}" ]; then
+  REDIS_HOST="$(echo "$REDIS_URL" | sed -E 's#redis://([^:@/]+).*#\1#' 2>/dev/null || true)"
+fi
+REDIS_HOST="${REDIS_HOST:-}"
 
 # Run a SQL query against the staging source DB and print the result.
 # Used for booking-lookup and reconciliation phases, which need fields the
@@ -229,9 +235,15 @@ phase_db_restore() {
     -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname='public';" 2>>"$LOG_FILE" || echo 0)
   log "  RLS policies on public: $policy_count"
 
-  # Cleanup
+  # Cleanup. DROP DATABASE fails if any session is still connected to the
+  # verification DB (e.g. an idle psql from the checks above), so terminate
+  # backends first and force the drop. Cleanup must never fail the phase.
   psql -h "$VERIFY_DB_HOST" -U "$VERIFY_DB_USER" -d postgres \
-    -c "DROP DATABASE IF EXISTS $verify_db;" >>"$LOG_FILE" 2>&1
+    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$verify_db' AND pid <> pg_backend_pid();" \
+    >>"$LOG_FILE" 2>&1 || warn "  could not terminate backends on $verify_db"
+  psql -h "$VERIFY_DB_HOST" -U "$VERIFY_DB_USER" -d postgres \
+    -c "DROP DATABASE IF EXISTS $verify_db WITH (FORCE);" >>"$LOG_FILE" 2>&1 \
+    || warn "  could not drop verification DB $verify_db"
   rm -f "$backup_file"
 
   if [ "${RESULTS[db_restore]:-pass}" != "fail" ] && [ "$rto" -le "$RTO_DB" ]; then
@@ -255,7 +267,13 @@ phase_cache_rebuild() {
   if [ -z "$REDIS_HOST" ]; then err "REDIS_HOST or REDIS_URL required"; exit 1; fi
 
   log "Flushing staging Redis (DB 0 only)..."
-  redis-cli -h "$REDIS_HOST" -n 0 FLUSHDB >>"$LOG_FILE" 2>&1
+  if ! redis-cli -h "$REDIS_HOST" -n 0 FLUSHDB >>"$LOG_FILE" 2>&1; then
+    err "Redis FLUSHDB failed against $REDIS_HOST"
+    RESULTS["cache_rebuild"]="fail"
+    NOTES["cache_rebuild"]="redis flush failed host=$REDIS_HOST"
+    log "Phase cache_rebuild: ${RESULTS[cache_rebuild]}"
+    return
+  fi
   local t0 t1 rto
   t0=$(date +%s)
 
@@ -267,6 +285,9 @@ phase_cache_rebuild() {
   local ids
   ids=$(curl -sf "$STAGING_API_URL/properties?limit=10&sort=views" \
         | jq -r '.[].id // .properties[].id // empty' 2>>"$LOG_FILE" || true)
+  # Normalise to a newline-separated list so the hit-rate loop below can index
+  # it reliably (the previous `sed -n` indexing assumed one id per line).
+  ids="$(echo "$ids" | tr -s '[:space:]' '\n' | sed '/^$/d')"
   for id in $ids; do
     curl -sf "$STAGING_API_URL/properties/$id" -o /dev/null >>"$LOG_FILE" 2>&1 || true
   done
@@ -279,14 +300,23 @@ phase_cache_rebuild() {
   t1=$(date +%s)
   rto=$((t1 - t0))
 
-  # Verify hit rate on next 100 requests
+  # Verify hit rate on next 100 requests. A "hit" is a successful (2xx)
+  # response for a warmed key; if no keys were warmed there is nothing to
+  # measure and the phase fails rather than silently reporting 0%.
   local hits=0 total=100
+  local id_list=()
+  while IFS= read -r line; do [ -n "$line" ] && id_list+=("$line"); done <<< "$ids"
+  if [ "${#id_list[@]}" -eq 0 ]; then
+    err "No property ids warmed — cannot measure cache hit rate"
+    RESULTS["cache_rebuild"]="fail"
+    NOTES["cache_rebuild"]="no warmed keys (property list/detail endpoints returned no ids)"
+    log "Phase cache_rebuild: ${RESULTS[cache_rebuild]}"
+    return
+  fi
   for i in $(seq 1 $total); do
-    local id
-    id=$(echo "$ids" | sed -n "$((i % 10 + 1))p")
-    [ -z "$id" ] && id="${ids%% *}"
-    if [ -n "$id" ]; then
-      curl -sf "$STAGING_API_URL/properties/$id" -o /dev/null >>"$LOG_FILE" 2>&1 && hits=$((hits + 1))
+    local id="${id_list[$(( (i - 1) % ${#id_list[@]} ))]}"
+    if curl -sf "$STAGING_API_URL/properties/$id" -o /dev/null >>"$LOG_FILE" 2>&1; then
+      hits=$((hits + 1))
     fi
   done
   local hit_rate=0
@@ -336,15 +366,22 @@ phase_sync_resume() {
   # entry". A direct ledger-lag check would need stellar-cli (not installed in
   # the drill runner); the sync_log age is a sufficient freshness proxy for
   # the drill and is recorded as a known gap in §7.2.
-  local last_sync age converged=0
+  local last_sync="" age="" converged=0
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 15
     last_sync=$(db_query "SELECT COALESCE(MAX(synced_at), 'epoch'::timestamptz) FROM sync_log WHERE entity_type='booking';" || echo "")
-    if [[ "$last_sync" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]] && [ "$last_sync" != "" ]; then
-      age=$(($(date +%s) - $(date -u -d "$last_sync" +%s 2>/dev/null || echo 0)))
-      log "  poll $i: last booking sync ${age}s ago"
-      # 120s freshness target — far tighter than the §2 30-ledger (~150s) target
-      if [ "$age" -ge 0 ] && [ "$age" -le 120 ]; then converged=1; break; fi
+    if [[ "$last_sync" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+      local sync_epoch now_epoch
+      sync_epoch=$(date -u -d "$last_sync" +%s 2>/dev/null || echo "")
+      now_epoch=$(date +%s)
+      if [ -n "$sync_epoch" ]; then
+        age=$((now_epoch - sync_epoch))
+        log "  poll $i: last booking sync ${age}s ago"
+        # 120s freshness target — far tighter than the §2 30-ledger (~150s) target
+        if [ "$age" -ge 0 ] && [ "$age" -le 120 ]; then converged=1; break; fi
+      else
+        log "  poll $i: could not parse sync timestamp '$last_sync'"
+      fi
     else
       log "  poll $i: no sync_log entries yet"
     fi
@@ -355,13 +392,13 @@ phase_sync_resume() {
   log "Sync resume completed in ${rto}s (target ${RTO_SYNC}s), converged=$converged, last_sync=$last_sync"
 
   if [ "$converged" -eq 1 ] && [ "$rto" -le "$RTO_SYNC" ] \
-     && [ "$sync_props_code" = "200" -o "$sync_props_code" = "202" ] \
-     && [ "$sync_book_code" = "200" -o "$sync_book_code" = "202" ]; then
+     && { [ "$sync_props_code" = "200" ] || [ "$sync_props_code" = "202" ]; } \
+     && { [ "$sync_book_code" = "200" ] || [ "$sync_book_code" = "202" ]; }; then
     RESULTS["sync_resume"]="pass"
     NOTES["sync_resume"]="rto=${rto}s age=${age}s sync_props=$sync_props_code sync_book=$sync_book_code"
   else
     RESULTS["sync_resume"]="fail"
-    NOTES["sync_resume"]="rto=${rto}s converged=$converged sync_props=$sync_props_code sync_book=$sync_book_code (if 404: sync.routes.ts not mounted at /api/v1/sync — see §7.2)"
+    NOTES["sync_resume"]="rto=${rto}s converged=$converged age=${age:-n/a} sync_props=$sync_props_code sync_book=$sync_book_code (if 404: sync.routes.ts not mounted at /api/v1/sync — see §7.2)"
   fi
   log "Phase sync_resume: ${RESULTS[sync_resume]}"
 }
@@ -400,7 +437,7 @@ phase_core_reads() {
 
   check_read "health/deep" "$STAGING_API_URL/health/deep"
   check_read "properties?limit=20" "$STAGING_API_URL/properties?limit=20"
-  check_read "properties/<id>" "$STAGING_API_URL/properties?limit=1"
+  check_read "properties?limit=1" "$STAGING_API_URL/properties?limit=1"
   check_read "search?q=apartment" "$STAGING_API_URL/properties/search?q=apartment"
   check_read "bookings (auth)" "$STAGING_API_URL/api/v1/bookings?limit=1" "$ADMIN_JWT"
 
@@ -452,6 +489,9 @@ phase_booking_lookup() {
   while IFS=$'\t' read -r id property_id user_id db_status on_chain_id escrow_id; do
     [ -z "$id" ] && continue
     total=$((total + 1))
+    # escrow_id is read for parity with the DB projection but is not part of
+    # the agreement checks below; mark it used to satisfy shellcheck.
+    : "$escrow_id"
 
     # DB vs API agreement: the admin API must return this booking with the
     # same status. jq filters the API response by id.
@@ -482,7 +522,7 @@ phase_booking_lookup() {
     # (off-chain-only). A fresh on-chain lookup requires the sync route to
     # be mounted (see §7.2 follow-up risk).
     local chain_ok=1
-    if [ -n "$on_chain_id" ] && [ "$on_chain_id" != "" ]; then
+    if [ -n "$on_chain_id" ]; then
       local last_sync_status
       last_sync_status=$(db_query "SELECT status FROM sync_log WHERE entity_type='booking' AND entity_id='$on_chain_id' ORDER BY synced_at DESC LIMIT 1;" || echo "")
       if [ -n "$last_sync_status" ] && [ "$last_sync_status" != "success" ] && [ "$last_sync_status" != "$db_status" ]; then
@@ -539,7 +579,7 @@ phase_reconciliation() {
                 -H "Authorization: Bearer $ADMIN_JWT" \
                 | jq -r '.pending // "unknown"' 2>>"$LOG_FILE" || echo "unknown")
       log "  poll $i: pending=$pending"
-      [ "$pending" = "false" ] || [ "$pending" = "0" ] && break
+      if [ "$pending" = "false" ] || [ "$pending" = "0" ]; then break; fi
     done
   else
     warn "Reconcile trigger unavailable (HTTP $reconcile_code) — using DB-only discrepancy check."
@@ -553,7 +593,9 @@ phase_reconciliation() {
   disc_a=$(db_query "SELECT COUNT(*) FROM bookings WHERE status IN ('Completed','Cancelled') AND (escrow_id IS NULL OR escrow_id = '');" || echo 0)
   disc_b=$(db_query "SELECT COUNT(*) FROM bookings WHERE status = 'escrow_reconcile_failed';" || echo 0)
   disc_c=$(db_query "SELECT COUNT(*) FROM bookings WHERE status IN ('Pending','Confirmed') AND (escrow_id IS NULL OR escrow_id = '');" || echo 0)
-  discrepancies=$(( ${disc_a:-0} + ${disc_b:-0} + ${disc_c:-0} ))
+  # Coerce to integers so a stray empty/whitespace result cannot break arithmetic.
+  disc_a=$(( ${disc_a:-0} + 0 )); disc_b=$(( ${disc_b:-0} + 0 )); disc_c=$(( ${disc_c:-0} + 0 ))
+  discrepancies=$(( disc_a + disc_b + disc_c ))
 
   t1=$(date +%s)
   rto=$((t1 - t0))
@@ -577,7 +619,8 @@ phase_report() {
   CURRENT_STEP="report"
   log "=== Phase: report (§6.8) ==="
 
-  # Aggregate targets
+  # Aggregate targets. A phase that was never run (e.g. --phase report alone)
+  # must not be treated as a pass; require an explicit "pass" for each.
   local reads_ok="fail" lookup_recon_ok="fail"
   if [ "${RESULTS[db_restore]:-}" = "pass" ] \
      && [ "${RESULTS[cache_rebuild]:-}" = "pass" ] \
@@ -634,5 +677,11 @@ case "$PHASE" in
   *) err "Unknown phase: $PHASE"; exit 2 ;;
 esac
 
-# Exit non-zero on failure so CI can gate
-[ "${RESULTS[overall]:-pass}" = "pass" ] && exit 0 || exit 1
+# Exit non-zero on failure so CI can gate. Default to failure when the overall
+# result is absent (e.g. a single non-report phase was run) so CI never passes
+# a drill that did not actually complete.
+if [ "${RESULTS[overall]:-fail}" = "pass" ]; then
+  exit 0
+else
+  exit 1
+fi

@@ -33,7 +33,12 @@ export type NotificationType =
   | 'message_received'
   | 'appeal_submitted'
   | 'report_notification'
-  | 'moderation_decision';
+  | 'moderation_decision'
+  | 'dispute_under_review'
+  | 'dispute_decision_recorded'
+  | 'dispute_settlement_pending'
+  | 'dispute_settlement_completed'
+  | 'dispute_settlement_failed';
 
 /** Coarse bucket used for filtering the notification list. */
 export type NotificationCategory =
@@ -82,6 +87,11 @@ export function categoryForType(type: NotificationType): NotificationCategory {
       return 'review';
     case 'dispute_initiated':
     case 'booking_disputed':
+    case 'dispute_under_review':
+    case 'dispute_decision_recorded':
+    case 'dispute_settlement_pending':
+    case 'dispute_settlement_completed':
+    case 'dispute_settlement_failed':
       return 'dispute';
     case 'message_received':
       return 'message';
@@ -145,6 +155,11 @@ const EMAIL_TEMPLATES: Partial<Record<NotificationType, string>> = {
   review_submitted: 'New Review Submitted',
   host_response: 'Host Responded to Your Review',
   dispute_initiated: 'Dispute Initiated',
+  dispute_under_review: 'Dispute Under Review',
+  dispute_decision_recorded: 'Dispute Decision Recorded',
+  dispute_settlement_pending: 'Dispute Settlement Pending',
+  dispute_settlement_completed: 'Dispute Settlement Completed',
+  dispute_settlement_failed: 'Dispute Settlement Failed',
   new_property: 'New Listing from a Host You Follow',
   system_alert: 'System Alert',
   report_created: 'New Report Submitted',
@@ -174,6 +189,11 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'appeal_submitted',
   'report_notification',
   'moderation_decision',
+  'dispute_under_review',
+  'dispute_decision_recorded',
+  'dispute_settlement_pending',
+  'dispute_settlement_completed',
+  'dispute_settlement_failed',
 ];
 
 /**
@@ -191,6 +211,13 @@ const SENSITIVE_DATA_KEYS = [
   'supportLink',
   'attempt',
   'audience',
+  'evidence',
+  'evidenceUrls',
+  'reviewerNotes',
+  'reviewerId',
+  'internalNotes',
+  'adminNotes',
+  'resolutionNotes',
 ] as const;
 
 /**
@@ -761,6 +788,150 @@ export async function createNotificationWithAllChannels(
 }
 
 export { EMAIL_TEMPLATES };
+
+// ─── Dispute timeline notifications ───────────────────────────────────────────
+
+/**
+ * Participant-safe dispute timeline stages.  Each stage maps to exactly one
+ * notification type so participants can distinguish a recorded decision from
+ * a completed (or still pending / failed) financial settlement.
+ */
+export type DisputeTimelineStage =
+  | 'opened'
+  | 'under_review'
+  | 'decision_recorded'
+  | 'settlement_pending'
+  | 'settlement_completed'
+  | 'settlement_failed';
+
+const DISPUTE_STAGE_NOTIFICATION_TYPE: Record<DisputeTimelineStage, NotificationType> = {
+  opened: 'dispute_initiated',
+  under_review: 'dispute_under_review',
+  decision_recorded: 'dispute_decision_recorded',
+  settlement_pending: 'dispute_settlement_pending',
+  settlement_completed: 'dispute_settlement_completed',
+  settlement_failed: 'dispute_settlement_failed',
+};
+
+/**
+ * Fields that must never be forwarded to participants from dispute records.
+ * Reviewer notes, evidence and internal identifiers stay server-side.
+ */
+const DISPUTE_INTERNAL_KEYS = [
+  'evidence',
+  'evidenceUrls',
+  'evidence_urls',
+  'reviewerNotes',
+  'reviewer_notes',
+  'reviewerId',
+  'reviewer_id',
+  'internalNotes',
+  'internal_notes',
+  'adminNotes',
+  'admin_notes',
+  'resolutionNotes',
+  'resolution_notes',
+  'internalNote',
+  'supportLink',
+] as const;
+
+/**
+ * Build a participant-safe payload for a dispute timeline notification.
+ * Only whitelisted, participant-facing fields are copied; anything else
+ * (evidence, reviewer notes, internal identifiers) is dropped.
+ */
+export function buildDisputeTimelinePayload(
+  stage: DisputeTimelineStage,
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    stage,
+    disputeId: input.disputeId ?? input.dispute_id ?? null,
+    bookingId: input.bookingId ?? input.booking_id ?? null,
+    status: input.status ?? null,
+  };
+
+  // Decision outcome is participant-facing (e.g. 'refund', 'release', 'split').
+  const outcome = input.outcome ?? input.decision ?? null;
+  if (outcome !== null && outcome !== undefined) payload.outcome = outcome;
+
+  // Financial action state — kept separate from the decision itself.
+  const financialAction = input.financialAction ?? input.financial_action ?? null;
+  if (financialAction !== null && financialAction !== undefined) {
+    payload.financialAction = financialAction;
+  }
+  const financialStatus = input.financialStatus ?? input.financial_status ?? null;
+  if (financialStatus !== null && financialStatus !== undefined) {
+    payload.financialStatus = financialStatus;
+  }
+
+  // Optional participant-facing copy fields.
+  for (const key of ['userEmail', 'userName', 'propertyTitle', 'amount', 'currency'] as const) {
+    if (input[key] !== undefined) payload[key] = input[key];
+  }
+
+  // Defensive: strip any internal keys that slipped through.
+  for (const key of DISPUTE_INTERNAL_KEYS) {
+    delete payload[key];
+  }
+
+  return payload;
+}
+
+/**
+ * Notify a single participant of a dispute timeline transition.
+ *
+ * Uses a deterministic event id (`dispute:<id>:<stage>`) so repeated
+ * resolution events / retries are idempotent and never duplicate.
+ */
+export async function notifyDisputeTimelineTransition(
+  userId: string,
+  stage: DisputeTimelineStage,
+  input: Record<string, unknown>,
+): Promise<ServiceResponse<Notification>> {
+  const type = DISPUTE_STAGE_NOTIFICATION_TYPE[stage];
+  if (!type) {
+    return { success: false, error: `Unknown dispute timeline stage: ${stage}` };
+  }
+
+  const payload = buildDisputeTimelinePayload(stage, input);
+  const disputeId = String(payload.disputeId ?? '');
+  const eventId = disputeId
+    ? `dispute:${disputeId}:${stage}`
+    : `dispute:${stage}:${String(payload.bookingId ?? userId)}`;
+
+  const deepLink = disputeId ? `/disputes/${disputeId}` : undefined;
+
+  return createNotification(userId, type, payload, { eventId, deepLink });
+}
+
+/**
+ * Notify all participants (guest and host) of a dispute timeline transition.
+ * Each participant gets their own idempotent notification; failures for one
+ * participant do not abort the other.
+ */
+export async function notifyDisputeParticipants(
+  participantIds: ReadonlyArray<string>,
+  stage: DisputeTimelineStage,
+  input: Record<string, unknown>,
+): Promise<ServiceResponse<{ notified: number }>> {
+  const unique = Array.from(new Set(participantIds.filter((id) => !!id)));
+  let notified = 0;
+
+  for (const userId of unique) {
+    try {
+      const result = await notifyDisputeTimelineTransition(userId, stage, input);
+      if (result.success) notified++;
+    } catch (err) {
+      console.error(
+        `[notifyDisputeParticipants] Failed to notify ${userId} for stage ${stage}:`,
+        err,
+      );
+    }
+  }
+
+  return { success: true, data: { notified } };
+}
 
 // ─── Host-follow new-listing fan-out ──────────────────────────────────────────
 
