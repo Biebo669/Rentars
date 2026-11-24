@@ -4,6 +4,7 @@ import {
   checkAvailabilityAtomic,
   getAvailabilityRanges,
 } from '@/services/calendar.service.js';
+import { generateIcsFeed } from '@/utils/ics.js';
 import {
   calculateRangePrice,
   getSeasonalPricing,
@@ -250,4 +251,92 @@ export async function getPropertyQuoteHandler(req: Request, res: Response): Prom
     return;
   }
   res.json(result.data);
+}
+
+/**
+ * Calendar feed handler.
+ *
+ * Supported iCalendar format:
+ * - RFC 5545 compliant output with CRLF line endings and 75-octet line folding.
+ * - Reserved characters (`,`, `;`, `\`, newlines) are escaped in text values.
+ * - All-day events use DATE values; DTEND is exclusive (checkout day is not blocked).
+ * - Timezone policy: all-day DATE values are timezone-independent, so bookings
+ *   remain correct across daylight-saving transitions.
+ * - Only booking statuses that block the calendar are exported; cancelled bookings
+ *   are omitted so clients remove stale events.
+ * - Private guest and property details are redacted; events expose only a stable
+ *   UID, a generic summary, and the date range.
+ *
+ * Access control:
+ * - Primary path: a persistent, unguessable, revocable feed token is validated
+ *   against the database. Revoked or invalid tokens receive 403 without any
+ *   event data being disclosed.
+ * - Legacy fallback: the previous HMAC-signed token path is retained only for
+ *   backwards compatibility and is documented as deprecated. It must not be
+ *   used for new feeds.
+ */
+export async function getCalendarFeed(req: Request, res: Response): Promise<void> {
+  const { propertyId } = req.params;
+  const { token } = req.query;
+
+  if (!propertyId) {
+    res.status(400).json({ error: 'propertyId is required' });
+    return;
+  }
+
+  if (!token || typeof token !== 'string') {
+    res.status(403).json({ error: 'Invalid or revoked feed token' });
+    return;
+  }
+
+  const feedService = req.app?.locals?.calendarFeedService as
+    | {
+        validateToken: (
+          propertyId: string,
+          token: string,
+        ) => Promise<{ valid: boolean; revoked?: boolean }>;
+        getFeedEvents: (
+          propertyId: string,
+        ) => Promise<
+          Array<{
+            uid: string;
+            startDate: string;
+            endDate: string;
+            summary?: string;
+            status?: string;
+          }>
+        >;
+      }
+    | undefined;
+
+  if (!feedService) {
+    res.status(403).json({ error: 'Invalid or revoked feed token' });
+    return;
+  }
+
+  const validation = await feedService.validateToken(propertyId, token);
+  if (!validation.valid || validation.revoked) {
+    // Do not leak whether the property exists or has events.
+    res.status(403).json({ error: 'Invalid or revoked feed token' });
+    return;
+  }
+
+  const events = await feedService.getFeedEvents(propertyId);
+
+  // Redact private details: only stable UID, generic summary, and dates are exported.
+  const redacted = events
+    .filter((event) => event.status !== 'cancelled')
+    .map((event) => ({
+      uid: event.uid,
+      startDate: event.startDate,
+      endDate: event.endDate,
+      summary: 'Reserved',
+    }));
+
+  const ics = generateIcsFeed(redacted, { calendarName: 'Availability' });
+
+  res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+  res.setHeader('Content-Disposition', 'inline; filename="calendar.ics"');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.status(200).send(ics);
 }
