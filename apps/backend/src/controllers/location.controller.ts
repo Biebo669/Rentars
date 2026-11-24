@@ -24,7 +24,7 @@ export async function reverseGeocodeAddress(req: Request, res: Response): Promis
   const result = await locationService.reverseGeocode(coordinates.lat, coordinates.lng);
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -37,7 +37,7 @@ export async function geocodeAddress(req: Request, res: Response): Promise<void>
   const result = await locationService.geocode(address as string);
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -64,7 +64,7 @@ export async function searchNearby(req: Request, res: Response): Promise<void> {
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -91,7 +91,7 @@ export async function getPriceComparison(req: Request, res: Response): Promise<v
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
