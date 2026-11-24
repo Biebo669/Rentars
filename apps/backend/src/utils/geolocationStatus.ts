@@ -176,6 +176,141 @@ export function isRetryableGeocodingFailure(httpStatus: number | 'network'): boo
   return httpStatus === 429 || httpStatus >= 500;
 }
 
+/**
+ * Maximum radius (in kilometres) accepted by nearby search. Anything larger is
+ * rejected rather than silently clamped so callers get a clear error instead of
+ * a query that scans the whole table.
+ */
+export const MAX_SEARCH_RADIUS_KM = 500;
+
+/** Default radius used when the caller does not supply one. */
+export const DEFAULT_SEARCH_RADIUS_KM = 25;
+
+export interface FieldError {
+  field: string;
+  message: string;
+}
+
+export interface GeospatialSearchInput {
+  latitude?: unknown;
+  longitude?: unknown;
+  radiusKm?: unknown;
+}
+
+export interface GeospatialSearchValidation {
+  valid: boolean;
+  errors: FieldError[];
+  /** Present only when `valid` is true. */
+  value?: { latitude: number; longitude: number; radiusKm: number };
+}
+
+/**
+ * Validate the geospatial portion of an advanced search request.
+ *
+ * Latitude and longitude must be supplied as a pair; supplying only one is a
+ * field-level error rather than a silent fallback to a non-geospatial search.
+ * Poles (±90) and the antimeridian (±180) are valid. The exact (0, 0) point is
+ * rejected because it is almost always a placeholder. Radius must be a finite
+ * number greater than zero and no larger than MAX_SEARCH_RADIUS_KM.
+ */
+export function validateGeospatialSearch(
+  input: GeospatialSearchInput
+): GeospatialSearchValidation {
+  const errors: FieldError[] = [];
+  const hasLat = input.latitude !== undefined && input.latitude !== null && input.latitude !== '';
+  const hasLng =
+    input.longitude !== undefined && input.longitude !== null && input.longitude !== '';
+
+  if (hasLat !== hasLng) {
+    errors.push({
+      field: hasLat ? 'longitude' : 'latitude',
+      message: 'Latitude and longitude must be provided together',
+    });
+  }
+
+  let lat: number | null = null;
+  let lng: number | null = null;
+
+  if (hasLat && hasLng) {
+    lat = toNumber(input.latitude);
+    lng = toNumber(input.longitude);
+
+    if (lat === null) {
+      errors.push({ field: 'latitude', message: 'Latitude must be a finite number' });
+    } else if (lat < -90 || lat > 90) {
+      errors.push({ field: 'latitude', message: 'Latitude must be between -90 and 90' });
+    }
+
+    if (lng === null) {
+      errors.push({ field: 'longitude', message: 'Longitude must be a finite number' });
+    } else if (lng < -180 || lng > 180) {
+      errors.push({ field: 'longitude', message: 'Longitude must be between -180 and 180' });
+    }
+
+    if (lat !== null && lng !== null && lat === 0 && lng === 0) {
+      errors.push({
+        field: 'latitude',
+        message: 'Coordinates (0, 0) are a placeholder, not a location',
+      });
+    }
+  }
+
+  let radiusKm = DEFAULT_SEARCH_RADIUS_KM;
+  const hasRadius =
+    input.radiusKm !== undefined && input.radiusKm !== null && input.radiusKm !== '';
+
+  if (hasRadius) {
+    const parsed = toNumber(input.radiusKm);
+    if (parsed === null) {
+      errors.push({ field: 'radiusKm', message: 'Radius must be a finite number' });
+    } else if (parsed <= 0) {
+      errors.push({ field: 'radiusKm', message: 'Radius must be greater than 0' });
+    } else if (parsed > MAX_SEARCH_RADIUS_KM) {
+      errors.push({
+        field: 'radiusKm',
+        message: `Radius must not exceed ${MAX_SEARCH_RADIUS_KM} km`,
+      });
+    } else {
+      radiusKm = parsed;
+    }
+  }
+
+  if (errors.length > 0) {
+    return { valid: false, errors };
+  }
+
+  return {
+    valid: true,
+    errors: [],
+    value: { latitude: lat as number, longitude: lng as number, radiusKm },
+  };
+}
+
+/**
+ * Whether a search request carries any geospatial intent. When it does not, the
+ * search must run as a plain non-geospatial query: missing coordinates must
+ * never exclude unrelated results or crash the request.
+ */
+export function hasGeospatialIntent(input: GeospatialSearchInput): boolean {
+  const present = (v: unknown) => v !== undefined && v !== null && v !== '';
+  return present(input.latitude) || present(input.longitude) || present(input.radiusKm);
+}
+
+/**
+ * Whether the geospatial schema (PostGIS extension, geometry column and its
+ * spatial index) is available. When it is not, callers should fall back to a
+ * non-geospatial search rather than erroring.
+ */
+export function isGeospatialSchemaAvailable(schema: {
+  postgisInstalled?: boolean | null;
+  geometryColumnPresent?: boolean | null;
+  spatialIndexPresent?: boolean | null;
+}): boolean {
+  return Boolean(
+    schema.postgisInstalled && schema.geometryColumnPresent && schema.spatialIndexPresent
+  );
+}
+
 function toNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (typeof value === 'string' && value.trim() !== '') {

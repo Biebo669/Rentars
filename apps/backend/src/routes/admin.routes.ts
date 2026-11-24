@@ -35,6 +35,7 @@ import {
   getUserDetail,
   suspendUser,
   activateUser,
+  changeUserRoleHandler,
   // Property management
   listAdminProperties,
   suspendProperty,
@@ -74,6 +75,8 @@ router.get('/users', requireScope('admin:users:read'), listUsers);
 router.get('/users/:id', requireScope('admin:users:read'), getUserDetail);
 router.post('/users/:id/suspend', requireScope('admin:users:suspend'), suspendUser);
 router.post('/users/:id/activate', requireScope('admin:users:activate'), activateUser);
+// Scope: admin:users:role → admin only. Actor role is re-checked against the DB in the service.
+router.patch('/users/:id/role', requireScope('admin:users:role'), changeUserRoleHandler);
 
 // ── Property management ───────────────────────────────────────────────────────
 // Scope: admin:properties:read     → admin, moderator, support
@@ -85,6 +88,12 @@ router.post('/properties/:id/suspend', requireScope('admin:properties:suspend'),
 router.post('/properties/:id/activate', requireScope('admin:properties:activate'), activateProperty);
 router.put('/properties/:id/featured', requireScope('admin:properties:feature'), setFeaturedHandler);
 router.delete('/properties/:id/featured', requireScope('admin:properties:feature'), clearFeaturedHandler);
+// POST /api/v1/admin/properties/:id/images/:imageId/moderation — approve | reject | remove (#922)
+router.post(
+  '/properties/:id/images/:imageId/moderation',
+  requireScope('admin:properties:moderate_images'),
+  moderateImage,
+);
 
 // ── Bookings (admin view) ─────────────────────────────────────────────────────
 // Scope: admin:bookings:read → admin, moderator, support, finance
@@ -119,6 +128,7 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 // Scope: admin:refunds:approve → admin, finance (HIGH-RISK — dual approval required)
 // Body: { booking_id: string, refund_amount: number, reason: string }
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
+import { moderateImage } from '@/controllers/propertyImage.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
 // ── Email delivery tracking ───────────────────────────────────────────────────
