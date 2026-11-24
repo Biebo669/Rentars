@@ -1,4 +1,10 @@
 import type { Request, Response } from 'express';
+import { propertySchema, updatePropertySchema } from '@/validators/property.validator.js';
+import type { ZodError } from 'zod';
+import crypto from 'node:crypto';
+import { recordPropertyView, getPropertyViewStats, getPropertyViewCount } from '@/services/propertyView.service.js';
+import { isBot } from '@/utils/botDetection.js';
+
 import {
   createProperty,
   deleteProperty,
@@ -18,10 +24,6 @@ import {
   type AdvancedSearchFilters,
   type Property,
 } from '@/services/property.service.js';
-import {
-  getAvailabilityRanges,
-  setAvailabilityRanges,
-} from '@/services/availability.service.js';
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
@@ -188,7 +190,13 @@ export async function getPropertyBySlugHandler(req: Request, res: Response): Pro
 }
 
 export async function createPropertyHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await createProperty(req.body);
+  // The same rules the web form enforces at each step. A direct API call must not bypass them (#920).
+  const parsed = propertySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ error: 'Validation failed', fields: zodFieldErrors(parsed.error) });
+    return;
+  }
+  const result = await createProperty({ ...req.body, ...parsed.data });
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -198,7 +206,12 @@ export async function createPropertyHandler(req: AuthRequest, res: Response): Pr
 }
 
 export async function updatePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await updateProperty(req.params.id, req.body, req.userId);
+  const parsed = updatePropertySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ error: 'Validation failed', fields: zodFieldErrors(parsed.error) });
+    return;
+  }
+  const result = await updateProperty(req.params.id, { ...req.body, ...parsed.data }, req.userId);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -206,10 +219,29 @@ export async function updatePropertyHandler(req: AuthRequest, res: Response): Pr
   res.json(result.data);
 }
 
-export async function deletePropertyHandler(req: Request, res: Response): Promise<void> {
-  const result = await deleteProperty(req.params.id);
+/**
+ * DELETE /api/v1/properties/:id
+ *
+ * Soft-deletes a listing. Only the owner or an administrator may do so, and a
+ * listing with unfinished reservations is refused with 409
+ * PROPERTY_HAS_ACTIVE_BOOKINGS. See docs/listing-lifecycle.md.
+ */
+export async function deletePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const actorId = req.userId ?? req.user?.id;
+  if (!actorId) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const result = await deleteProperty(req.params.id, {
+    id: actorId,
+    role: req.user?.role,
+  });
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({
+      error: result.error,
+      ...(result.code ? { code: result.code } : {}),
+    });
     return;
   }
   res.status(204).send();
@@ -292,6 +324,21 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     return;
   }
 
+  // Validate guests (#944): the same guest-count range enforced at listing
+  // creation, quote, and booking creation. Zero, negative, non-integer, and
+  // non-numeric values fail explicitly instead of being coerced to a default.
+  const guests_raw = req.query.guests !== undefined ? Number(req.query.guests) : undefined;
+  if (
+    guests_raw !== undefined &&
+    (!Number.isInteger(guests_raw) || guests_raw < MIN_GUESTS || guests_raw > MAX_GUESTS)
+  ) {
+    res.status(400).json({
+      error: `guests must be an integer between ${MIN_GUESTS} and ${MAX_GUESTS}`,
+      code: 'INVALID_GUEST_COUNT',
+    });
+    return;
+  }
+
   const filters: AdvancedSearchFilters = {
     query: req.query.q as string,
     city: req.query.city as string,
@@ -301,7 +348,7 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     bedrooms: req.query.bedrooms ? Number(req.query.bedrooms) : undefined,
     min_bathrooms: min_bathrooms_raw,
     property_types,
-    guests: req.query.guests ? Number(req.query.guests) : undefined,
+    guests: guests_raw,
     amenities: req.query.amenities
       ? Array.isArray(req.query.amenities)
         ? (req.query.amenities as string[])
@@ -389,29 +436,6 @@ export async function trackSuggestionAcceptedHandler(req: Request, res: Response
 }
 
 // ─── Availability ─────────────────────────────────────────────────────────────
-
-export async function getAvailability(req: Request, res: Response): Promise<void> {
-  try {
-    const ranges = await getAvailabilityRanges(req.params.id);
-    res.json(ranges);
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-}
-
-export async function setAvailability(req: AuthRequest, res: Response): Promise<void> {
-  try {
-    const ranges = await setAvailabilityRanges(req.params.id, req.userId!, req.body.ranges);
-    res.json(ranges);
-  } catch (err) {
-    const message = (err as Error).message;
-    if (message.startsWith('Forbidden') || message === 'Property not found') {
-      res.status(message.startsWith('Forbidden') ? 403 : 404).json({ error: message });
-      return;
-    }
-    res.status(400).json({ error: message });
-  }
-}
 
 // ─── Duplicate ────────────────────────────────────────────────────────────────
 
@@ -528,6 +552,16 @@ export async function getViewStatsHandler(req: Request, res: Response): Promise<
 // ─── Occupancy heatmap ────────────────────────────────────────────────────────
 
 import { getOccupancyHeatmap } from '@/services/occupancy.service.js';
+import { MIN_GUESTS, MAX_GUESTS } from '@/validators/guestCount.js';
+
+function zodFieldErrors(error: ZodError): Record<string, string[]> {
+  const fields: Record<string, string[]> = {};
+  for (const issue of error.issues) {
+    const key = issue.path.join('.') || '_';
+    (fields[key] ??= []).push(issue.message);
+  }
+  return fields;
+}
 
 /**
  * GET /api/v1/properties/:id/occupancy-heatmap

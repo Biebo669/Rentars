@@ -1,5 +1,9 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { RESERVING_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
+import { toDay } from '@/utils/availabilityRange.js';
+import { nightsBetween } from './availability.service.js';
+import type { IcsEventInput } from '@/utils/ics.js';
 
 export interface AvailabilityWindow {
   date: string;
@@ -12,6 +16,61 @@ export interface CalendarMonth {
   year: number;
   month: number;
   days: AvailabilityWindow[];
+}
+
+/**
+ * Booking statuses that appear in the calendar feed. Reserving statuses are
+ * exported as confirmed events; cancelled bookings are exported as cancelled
+ * events so clients can remove previously published occurrences.
+ */
+export const CALENDAR_FEED_STATUSES = [
+  ...RESERVING_BOOKING_STATUSES,
+  'cancelled',
+] as const;
+
+/**
+ * Build iCalendar events for a property's bookings.
+ *
+ * Date semantics: stays are half-open [check_in, check_out) on UTC calendar
+ * days, so DTSTART is the check-in day and DTEND is the check-out day
+ * (exclusive), matching the all-day event convention used by `ics.ts`.
+ *
+ * Privacy: exported events intentionally omit tenant name, email, phone and
+ * the property's full street address. Only a generic summary and the stable
+ * booking UID are exposed.
+ */
+export async function getCalendarFeedEvents(
+  propertyId: string,
+): Promise<ServiceResponse<IcsEventInput[]>> {
+  const { data: bookings, error } = await supabase
+    .from('bookings')
+    .select('id, check_in, check_out, status, updated_at')
+    .eq('property_id', propertyId)
+    .in('status', [...CALENDAR_FEED_STATUSES])
+    .order('check_in', { ascending: true });
+
+  if (error) {
+    return { success: false, error: 'Failed to load calendar events' };
+  }
+
+  const events: IcsEventInput[] = (bookings ?? []).map((booking) => {
+    const isCancelled = booking.status === 'cancelled';
+    const startDay = toDay(new Date(booking.check_in));
+    const endDay = toDay(new Date(booking.check_out));
+
+    return {
+      // Stable, unguessable-per-booking identifier so updates replace the
+      // existing occurrence instead of duplicating it.
+      uid: `booking-${booking.id}@stayhub`,
+      startDate: startDay,
+      endDate: endDay,
+      summary: isCancelled ? 'Booking cancelled' : 'Reserved',
+      status: isCancelled ? 'CANCELLED' : 'CONFIRMED',
+      lastModified: booking.updated_at ? new Date(booking.updated_at) : undefined,
+    };
+  });
+
+  return { success: true, data: events };
 }
 
 /**
@@ -52,12 +111,12 @@ export async function getMonthAvailability(
     .lte('start_date', endOfMonth.toISOString().split('T')[0])
     .gte('end_date', startOfMonth.toISOString().split('T')[0]);
 
-  // Fetch bookings for this month (non-cancelled)
+  // Fetch bookings that occupy dates this month (same status set as the booking RPC)
   const { data: bookings } = await supabase
     .from('bookings')
     .select('check_in, check_out')
     .eq('property_id', propertyId)
-    .neq('status', 'Cancelled')
+    .in('status', [...RESERVING_BOOKING_STATUSES])
     .lte('check_in', endOfMonth.toISOString().split('T')[0])
     .gte('check_out', startOfMonth.toISOString().split('T')[0]);
 
@@ -117,8 +176,14 @@ export async function checkAvailabilityAtomic(
     return { success: false, error: 'check_in must be before check_out' };
   }
 
+  // Stays are half-open [check_in, check_out) on UTC calendar days, the same rule
+  // the booking RPC and the calendar use. Adjacent stays (one checks out on the
+  // day another checks in) do not conflict.
+  const inDay = toDay(checkIn);
+  const outDay = toDay(checkOut);
+
   // Minimum stay validation
-  const nights = Math.ceil((checkOut.getTime() - checkIn.getTime()) / (24 * 3600 * 1000));
+  const nights = nightsBetween(checkIn, checkOut);
   if (nights < minimumStay) {
     return {
       success: true,
@@ -129,14 +194,14 @@ export async function checkAvailabilityAtomic(
     };
   }
 
-  // Lock + check overlapping bookings (pessimistic)
+  // Check overlapping reserving bookings
   const { data: conflicts, error: conflictError } = await supabase
     .from('bookings')
     .select('id')
     .eq('property_id', propertyId)
-    .neq('status', 'Cancelled')
-    .lte('check_in', checkOutStr)
-    .gte('check_out', checkInStr)
+    .in('status', [...RESERVING_BOOKING_STATUSES])
+    .lt('check_in', outDay)
+    .gt('check_out', inDay)
     .limit(1);
 
   if (conflictError) {
@@ -156,8 +221,8 @@ export async function checkAvailabilityAtomic(
     .select('id')
     .eq('property_id', propertyId)
     .eq('is_available', false)
-    .lte('start_date', checkOutStr)
-    .gte('end_date', checkInStr)
+    .lt('start_date', outDay)
+    .gt('end_date', inDay)
     .limit(1);
 
   if (blocked && blocked.length > 0) {

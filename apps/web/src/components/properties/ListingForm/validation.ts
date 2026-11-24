@@ -1,29 +1,369 @@
-import { z } from 'zod';
+/**
+ * Listing form validation (#920).
+ *
+ * Three layers, each enforced:
+ *  1. `validateStep` runs when the host tries to leave a step. A step with invalid
+ *     required data cannot be left.
+ *  2. `validateListing` runs on submit over the whole payload, not only the steps
+ *     the host has visited (a draft may have been restored or edited).
+ *  3. The API validates again (apps/backend/src/validators/property.validator.ts).
+ *     `toApiPayload` builds the request from the same values, using the field names
+ *     and limits that the API expects.
+ *
+ * Limits that mirror the API are written as constants so that a change to either
+ * side is visible in one place. Form-only policy (a $10 minimum price, at least one
+ * amenity, at least one photo) is marked as such.
+ */
 
-export const listingFormSchema = z.object({
-  title: z.string().min(5, 'Title must be at least 5 characters').max(100),
-  description: z.string().min(20, 'Description must be at least 20 characters').max(2000),
-  propertyType: z.enum(['apartment', 'house', 'villa', 'condo', 'studio']),
-  address: z.string().min(5, 'Address is required'),
-  city: z.string().min(2, 'City is required'),
-  state: z.string().min(2, 'State is required'),
-  zipCode: z.string().regex(/^\d{5}(-\d{4})?$/, 'Invalid zip code'),
-  maxGuests: z.number().int().min(1, 'At least 1 guest required'),
-  bedrooms: z.number().int().min(0, 'Bedrooms must be 0 or more'),
-  bathrooms: z.number().int().min(0, 'Bathrooms must be 0 or more'),
-  amenities: z.array(z.string()).min(1, 'Select at least one amenity'),
-  images: z.array(z.instanceof(File)).min(1, 'Upload at least one image'),
-  pricePerNight: z.number().min(10, 'Price must be at least $10'),
-  cleaningFee: z.number().min(0),
-  serviceFee: z.number().min(0),
-  // House rules
-  petsAllowed: z.boolean().default(false),
-  smokingAllowed: z.boolean().default(false),
-  eventsAllowed: z.boolean().default(false),
-  quietHoursStart: z.string().default(''),
-  quietHoursEnd: z.string().default(''),
-  additionalRules: z.string().max(2000, 'Additional rules must be under 2000 characters').default(''),
-  agreeToTerms: z.boolean().refine((val) => val === true, 'You must agree to terms'),
-});
+import type { ListingFormData, ListingStep } from './types';
 
-export type ListingFormSchema = z.infer<typeof listingFormSchema>;
+/**
+ * Validation messages are i18n keys, not English text (#994). The form renders them
+ * with `t(key, params)`; `params` carries the interpolation values (limits, ranges)
+ * and plural counts. Keys live under `listing.validation.*` in every locale.
+ */
+export type ValidationMessage = { key: string; params?: Record<string, string | number> };
+
+/** A form error is either a plain i18n key or a key plus interpolation params. */
+export type FormError = string | ValidationMessage;
+
+const msg = (key: string, params?: Record<string, string | number>): ValidationMessage =>
+  params ? { key, params } : { key };
+
+// ── API-mirrored limits (keep in sync with property.validator.ts) ────────────
+
+export const TITLE_MIN = 3;
+export const TITLE_MAX = 100;
+export const DESCRIPTION_MIN = 10;
+export const DESCRIPTION_MAX = 2000;
+export const ADDITIONAL_RULES_MAX = 2000;
+export const CITY_MAX = 100;
+export const COUNTRY_MAX = 100;
+export const LAT_RANGE: [number, number] = [-90, 90];
+export const LNG_RANGE: [number, number] = [-180, 180];
+/**
+ * Guest capacity bounds. Mirrors the backend constants (MAX_GUESTS_MIN / MAX_GUESTS_MAX in
+ * property.validator.ts) and the database CHECK constraint on listings.max_guests, so the
+ * form, search filters, quotes and booking creation all agree on the valid range.
+ */
+export const MAX_GUESTS_MIN = 1;
+export const MAX_GUESTS_MAX = 50;
+
+/** Canonical amenity ids accepted by the API (apps/backend/src/types/amenities.ts). */
+export const AMENITY_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'wifi', label: 'WiFi' },
+  { id: 'parking', label: 'Parking' },
+  { id: 'pool', label: 'Pool' },
+  { id: 'gym', label: 'Gym' },
+  { id: 'air_conditioning', label: 'Air conditioning' },
+  { id: 'heating', label: 'Heating' },
+  { id: 'kitchen', label: 'Kitchen' },
+  { id: 'washer', label: 'Washer' },
+  { id: 'dryer', label: 'Dryer' },
+  { id: 'tv', label: 'TV' },
+  { id: 'workspace', label: 'Workspace' },
+  { id: 'elevator', label: 'Elevator' },
+  { id: 'hot_tub', label: 'Hot tub' },
+  { id: 'bbq_grill', label: 'BBQ grill' },
+  { id: 'fireplace', label: 'Fireplace' },
+  { id: 'beach_access', label: 'Beach access' },
+  { id: 'ski_access', label: 'Ski access' },
+  { id: 'pet_friendly', label: 'Pet friendly' },
+  { id: 'smoking_allowed', label: 'Smoking allowed' },
+  { id: 'wheelchair_accessible', label: 'Wheelchair accessible' },
+];
+const AMENITY_IDS = new Set(AMENITY_OPTIONS.map((a) => a.id));
+
+// ── Form-only policy ─────────────────────────────────────────────────────────
+
+export const PROPERTY_TYPES = ['apartment', 'house', 'villa', 'condo', 'studio'] as const;
+/** Form policy: the minimum nightly price shown to guests. The API only requires > 0. */
+export const MIN_PRICE_PER_NIGHT = 10;
+/** Form policy: a listing needs at least one amenity and one photo. */
+export const MIN_AMENITIES = 1;
+export const MIN_PHOTOS = 1;
+
+export type FormErrors = Record<string, FormError>;
+
+/** Which step owns each field. Used to send the host back to the right step. */
+export const FIELD_STEP: Record<string, ListingStep> = {
+  title: 'basic',
+  description: 'basic',
+  propertyType: 'basic',
+  maxGuests: 'basic',
+  bedrooms: 'basic',
+  bathrooms: 'basic',
+  address: 'location',
+  city: 'location',
+  state: 'location',
+  zipCode: 'location',
+  country: 'location',
+  latitude: 'location',
+  longitude: 'location',
+  amenities: 'amenities',
+  images: 'photos',
+  pricePerNight: 'pricing',
+  cleaningFee: 'pricing',
+  serviceFee: 'pricing',
+  minNights: 'pricing',
+  maxNights: 'pricing',
+  checkInTime: 'pricing',
+  checkOutTime: 'pricing',
+  additionalRules: 'rules',
+  quietHoursStart: 'rules',
+  quietHoursEnd: 'rules',
+  agreeToTerms: 'review',
+};
+
+const TIME_PATTERN = /^\d{2}:\d{2}$/;
+const US_ZIP_PATTERN = /^\d{5}(-\d{4})?$/;
+
+const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isWhole = (v: unknown): v is number => isFiniteNumber(v) && Number.isInteger(v);
+
+const STEP_RULES: Record<ListingStep, (d: Partial<ListingFormData>, e: FormErrors) => void> = {
+  basic(d, e) {
+    const title = (d.title ?? '').trim();
+    if (title.length < TITLE_MIN) {
+      e.title = msg('listing.validation.title.min', { count: TITLE_MIN });
+    } else if (title.length > TITLE_MAX) {
+      e.title = msg('listing.validation.title.max', { count: TITLE_MAX });
+    }
+
+    const description = (d.description ?? '').trim();
+    if (description.length < DESCRIPTION_MIN) {
+      e.description = msg('listing.validation.description.min', { count: DESCRIPTION_MIN });
+    } else if (description.length > DESCRIPTION_MAX) {
+      e.description = msg('listing.validation.description.max', { count: DESCRIPTION_MAX });
+    }
+
+    if (!d.propertyType || !(PROPERTY_TYPES as readonly string[]).includes(d.propertyType)) {
+      e.propertyType = 'listing.validation.propertyType.required';
+    }
+    if (!isWhole(d.maxGuests) || d.maxGuests < 1) {
+      e.maxGuests = msg('listing.validation.maxGuests.min', { count: 1 });
+    }
+    if (!isWhole(d.bedrooms) || d.bedrooms < 0) {
+      e.bedrooms = msg('listing.validation.bedrooms.min', { count: 0 });
+    }
+    if (!isWhole(d.bathrooms) || d.bathrooms < 0) {
+      e.bathrooms = msg('listing.validation.bathrooms.min', { count: 0 });
+    }
+  },
+
+  location(d, e) {
+    if ((d.address ?? '').trim().length < 5) e.address = 'listing.validation.address.required';
+    const city = (d.city ?? '').trim();
+    if (city.length < 1) e.city = 'listing.validation.city.required';
+    else if (city.length > CITY_MAX) {
+      e.city = msg('listing.validation.city.max', { count: CITY_MAX });
+    }
+
+    const country = (d.country ?? '').trim();
+    if (country.length < 1) e.country = 'listing.validation.country.required';
+    else if (country.length > COUNTRY_MAX) {
+      e.country = msg('listing.validation.country.max', { count: COUNTRY_MAX });
+    }
+
+    if (!isFiniteNumber(d.latitude) || d.latitude < LAT_RANGE[0] || d.latitude > LAT_RANGE[1]) {
+      e.latitude = msg('listing.validation.latitude.range', {
+        min: LAT_RANGE[0],
+        max: LAT_RANGE[1],
+      });
+    }
+    if (!isFiniteNumber(d.longitude) || d.longitude < LNG_RANGE[0] || d.longitude > LNG_RANGE[1]) {
+      e.longitude = msg('listing.validation.longitude.range', {
+        min: LNG_RANGE[0],
+        max: LNG_RANGE[1],
+      });
+    }
+
+    // ZIP format is checked only for US addresses, because that is the only format the form knows.
+    if (country.toUpperCase() === 'US' && !US_ZIP_PATTERN.test(d.zipCode ?? '')) {
+      e.zipCode = 'listing.validation.zipCode.invalid';
+    }
+  },
+
+  amenities(d, e) {
+    const selected = d.amenities ?? [];
+    if (selected.length < MIN_AMENITIES) {
+      e.amenities = msg('listing.validation.amenities.min', { count: MIN_AMENITIES });
+    } else if (selected.some((a) => !AMENITY_IDS.has(a))) {
+      e.amenities = 'listing.validation.amenities.unsupported';
+    }
+  },
+
+  photos(d, e) {
+    if ((d.images ?? []).length < MIN_PHOTOS) {
+      e.images = msg('listing.validation.images.min', { count: MIN_PHOTOS });
+    }
+  },
+
+  pricing(d, e) {
+    if (!isFiniteNumber(d.pricePerNight) || d.pricePerNight < MIN_PRICE_PER_NIGHT) {
+      // The amount is passed as a number so each locale formats its own currency.
+      e.pricePerNight = msg('listing.validation.pricePerNight.min', {
+        amount: MIN_PRICE_PER_NIGHT,
+      });
+    }
+    if (!isFiniteNumber(d.cleaningFee) || d.cleaningFee < 0) {
+      e.cleaningFee = 'listing.validation.cleaningFee.negative';
+    }
+    if (!isFiniteNumber(d.serviceFee) || d.serviceFee < 0) {
+      e.serviceFee = 'listing.validation.serviceFee.negative';
+    }
+
+    const minNights = d.minNights ?? 1;
+    if (!isWhole(minNights) || minNights < 1) {
+      e.minNights = msg('listing.validation.minNights.min', { count: 1 });
+    }
+    if (d.maxNights !== null && d.maxNights !== undefined) {
+      if (!isWhole(d.maxNights) || d.maxNights < minNights) {
+        e.maxNights = 'listing.validation.maxNights.belowMin';
+      }
+    }
+
+    if (!TIME_PATTERN.test(d.checkInTime ?? '')) {
+      e.checkInTime = 'listing.validation.checkInTime.format';
+    }
+    if (!TIME_PATTERN.test(d.checkOutTime ?? '')) {
+      e.checkOutTime = 'listing.validation.checkOutTime.format';
+    }
+  },
+
+  rules(d, e) {
+    if ((d.additionalRules ?? '').length > ADDITIONAL_RULES_MAX) {
+      e.additionalRules = msg('listing.validation.additionalRules.max', {
+        count: ADDITIONAL_RULES_MAX,
+      });
+    }
+    const start = d.quietHoursStart ?? '';
+    const end = d.quietHoursEnd ?? '';
+    // Quiet hours are a pair: a start without an end, or the reverse, is not a rule.
+    if (start !== '' && !TIME_PATTERN.test(start)) {
+      e.quietHoursStart = 'listing.validation.quietHours.format';
+    }
+    if (end !== '' && !TIME_PATTERN.test(end)) {
+      e.quietHoursEnd = 'listing.validation.quietHours.format';
+    }
+    if ((start === '') !== (end === '')) {
+      e[start === '' ? 'quietHoursStart' : 'quietHoursEnd'] =
+        'listing.validation.quietHours.pair';
+    }
+  },
+
+  review(d, e) {
+    if (d.agreeToTerms !== true) e.agreeToTerms = 'listing.validation.agreeToTerms.required';
+  },
+};
+
+/** Validates only the fields the given step owns. Returns {} when the step may be left. */
+export function validateStep(step: ListingStep, data: Partial<ListingFormData>): FormErrors {
+  const errors: FormErrors = {};
+  STEP_RULES[step](data, errors);
+  return errors;
+}
+
+/**
+ * Validates every step. Returns the errors, and the first step that has one, so the
+ * form can take the host there.
+ */
+export function validateListing(
+  data: Partial<ListingFormData>,
+  steps: readonly ListingStep[] = Object.keys(STEP_RULES) as ListingStep[]
+): { errors: FormErrors; firstInvalidStep: ListingStep | null } {
+  const errors: FormErrors = {};
+  let firstInvalidStep: ListingStep | null = null;
+  for (const step of steps) {
+    const stepErrors = validateStep(step, data);
+    if (Object.keys(stepErrors).length > 0 && firstInvalidStep === null) firstInvalidStep = step;
+    Object.assign(errors, stepErrors);
+  }
+  return { errors, firstInvalidStep };
+}
+
+/**
+ * Builds the JSON body the create endpoint expects. Field names and nesting follow
+ * the API validator. Photos are not part of this body: they are uploaded afterwards,
+ * one at a time, so each one's result can be reported.
+ */
+export function toApiPayload(data: Partial<ListingFormData>): Record<string, unknown> {
+  return {
+    title: (data.title ?? '').trim(),
+    description: (data.description ?? '').trim(),
+    price_per_night: data.pricePerNight,
+    location: {
+      city: (data.city ?? '').trim(),
+      country: (data.country ?? '').trim(),
+      lat: data.latitude,
+      lng: data.longitude,
+    },
+    amenities: data.amenities ?? [],
+    max_guests: data.maxGuests,
+    bedrooms: data.bedrooms,
+    bathrooms: data.bathrooms,
+    min_nights: data.minNights ?? 1,
+    max_nights: data.maxNights ?? null,
+    check_in_time: data.checkInTime,
+    check_out_time: data.checkOutTime,
+    property_type: data.propertyType,
+  };
+}
+
+/** Maps an API validation field (snake_case path) back to the form field the host sees. */
+const API_FIELD_TO_FORM: Record<string, string> = {
+  title: 'title',
+  description: 'description',
+  price_per_night: 'pricePerNight',
+  'location.city': 'city',
+  'location.country': 'country',
+  'location.lat': 'latitude',
+  'location.lng': 'longitude',
+  max_guests: 'maxGuests',
+  bedrooms: 'bedrooms',
+  bathrooms: 'bathrooms',
+  min_nights: 'minNights',
+  max_nights: 'maxNights',
+  check_in_time: 'checkInTime',
+  check_out_time: 'checkOutTime',
+};
+
+/** Converts a server `fields` map into form errors, keyed by the form's field names. */
+export function apiErrorsToFormErrors(fields: Record<string, string[]>): {
+  errors: FormErrors;
+  firstInvalidStep: ListingStep | null;
+} {
+  const errors: FormErrors = {};
+  let firstInvalidStep: ListingStep | null = null;
+  for (const [apiField, messages] of Object.entries(fields)) {
+    const formField =
+      API_FIELD_TO_FORM[apiField] ?? (apiField.startsWith('amenities') ? 'amenities' : apiField);
+    // Server messages are already localized by the API; provider error codes are not
+    // translated, so they are passed through unchanged.
+    errors[formField] = messages[0] ?? 'listing.validation.invalidValue';
+    const step = FIELD_STEP[formField];
+    if (step && firstInvalidStep === null) firstInvalidStep = step;
+  }
+  return { errors, firstInvalidStep };
+}
+
+/**
+ * Returns the first invalid field in the order the form renders it, so the form can
+ * move focus to that control and announce its error (#995). `fieldOrder` is the
+ * rendered order of the fields on the current step.
+ */
+export function firstInvalidField(
+  errors: FormErrors,
+  fieldOrder: readonly string[]
+): string | null {
+  for (const field of fieldOrder) {
+    if (errors[field] !== undefined) return field;
+  }
+  const remaining = Object.keys(errors);
+  return remaining.length > 0 ? remaining[0] : null;
+}
+
+/** Resolves a form error to its i18n key and interpolation params. */
+export function resolveFormError(error: FormError): ValidationMessage {
+  return typeof error === 'string' ? { key: error } : error;
+}

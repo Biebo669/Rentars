@@ -6,6 +6,7 @@
  * error handling is consistent.
  */
 
+import { randomUUID } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
@@ -15,6 +16,7 @@ import { executePaginatedQuery } from '../utils/pagination.js';
 import { CANONICAL_AMENITIES } from '@/types/amenities.js';
 import { sanitizeLongText, sanitizeShortText } from '@/utils/sanitize.js';
 import { generateSlug } from '@/utils/slug.js';
+import { ACTIVE_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
 
 export interface PropertyImage {
   id: string;
@@ -26,6 +28,75 @@ export interface PropertyImage {
 const TTL_ALL = 60;
 const TTL_ONE = 300;
 const TTL_FEATURED = 120;
+
+/** Postgres unique_violation: the slug unique index rejected an insert. */
+const UNIQUE_VIOLATION = '23505';
+/** Fresh ids to try when a generated slug collides before giving up. */
+const SLUG_INSERT_ATTEMPTS = 3;
+
+// ─── Guest capacity rules ─────────────────────────────────────────────────────
+
+/**
+ * Guest-count bounds shared by listing creation, listing updates, search
+ * filters, quote calculation, and booking creation (#944).
+ *
+ * A listing's `max_guests` must be an integer within [MIN_GUESTS, MAX_GUESTS].
+ * A booking's guest count must be an integer within [MIN_GUESTS, listing.max_guests].
+ * Keeping these in one place guarantees search and booking agree on the maximum
+ * for every listing.
+ */
+export const MIN_GUESTS = 1;
+export const MAX_GUESTS = 50;
+
+/**
+ * Validate a stored/requested listing capacity (`max_guests`).
+ *
+ * @returns An error message for the first violation, or null when valid.
+ */
+export function validateMaxGuests(value: unknown): string | null {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    return 'max_guests must be an integer';
+  }
+  if (value < MIN_GUESTS) {
+    return `max_guests must be at least ${MIN_GUESTS}`;
+  }
+  if (value > MAX_GUESTS) {
+    return `max_guests must be at most ${MAX_GUESTS}`;
+  }
+  return null;
+}
+
+/**
+ * Validate a requested guest count against a listing's current capacity.
+ *
+ * Used by search filters, quote calculation, and booking creation so that all
+ * three agree on the maximum for a given listing. A missing/invalid stored
+ * capacity fails explicitly rather than defaulting to an unsafe value.
+ *
+ * @param guests      - Requested number of guests.
+ * @param maxGuests   - The selected property's current `max_guests`.
+ * @returns An error message for the first violation, or null when valid.
+ */
+export function validateGuestCount(
+  guests: unknown,
+  maxGuests: unknown,
+): string | null {
+  if (typeof guests !== 'number' || !Number.isInteger(guests)) {
+    return 'guests must be an integer';
+  }
+  if (guests < MIN_GUESTS) {
+    return `guests must be at least ${MIN_GUESTS}`;
+  }
+  // A listing with a missing or invalid stored capacity cannot be booked safely.
+  const capacityError = validateMaxGuests(maxGuests);
+  if (capacityError) {
+    return `Listing capacity is invalid: ${capacityError}`;
+  }
+  if (guests > (maxGuests as number)) {
+    return `guests must not exceed the listing capacity of ${maxGuests}`;
+  }
+  return null;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -263,6 +334,8 @@ export async function getPropertyById(
     .from('property_images')
     .select('id, url, is_primary, display_order')
     .eq('property_id', id)
+    // Public and cacheable: only moderator-approved images are served here (#922).
+    .eq('moderation_status', 'approved')
     .order('display_order', { ascending: true });
 
   if (!imageError && Array.isArray(imageRows)) {
@@ -302,6 +375,14 @@ export async function createProperty(
     if (amenityError) return { success: false, error: amenityError };
   }
 
+  // Enforce the shared guest-capacity range at creation (#944).
+  if (payload.max_guests !== undefined) {
+    const guestError = validateMaxGuests(payload.max_guests);
+    if (guestError) {
+      return { success: false, error: guestError, statusCode: 400, field: 'max_guests' };
+    }
+  }
+
   // Sanitize user-generated text fields before storing
   const sanitized: Partial<Property> = {
     ...payload,
@@ -314,35 +395,38 @@ export async function createProperty(
 
   // Guard against titles that produce no valid slug (#418).
   // generateSlug falls back to "property-<suffix>" for empty bases, but a title
-  // with no sluggable characters is itself invalid — reject it early.
-  const prospectiveSlug = generateSlug(trimmedTitle, payload.city, 'probe');
-  if (prospectiveSlug.startsWith('property-')) {
+  // with no letters or digits at all is invalid. Non-Latin titles are allowed:
+  // they get the "property" base plus the id suffix, which stays unique.
+  if (!/[\p{L}\p{N}]/u.test(trimmedTitle)) {
     return { success: false, error: 'Property title must contain at least one letter or digit' };
   }
 
-  const { data, error } = await supabase
-    .from('properties')
-    .insert(sanitized)
-    .select()
-    .single();
+  // The slug is derived from the id, so choose the id first and write the row
+  // once, with its slug. A separate follow-up UPDATE could fail and leave a
+  // listing with no URL. If the slug collides with the unique index, draw a
+  // fresh id and try again.
+  let property: Property | null = null;
+  let lastError: string | null = null;
+  for (let attempt = 0; attempt < SLUG_INSERT_ATTEMPTS && !property; attempt++) {
+    const id = randomUUID();
+    const slug = generateSlug(trimmedTitle, payload.city, id);
+    const { data, error } = await supabase
+      .from('properties')
+      .insert({ ...sanitized, id, slug })
+      .select()
+      .single();
 
-  if (error) {
-    return { success: false, error: error.message };
+    if (!error) {
+      property = data as Property;
+    } else if ((error as { code?: string }).code === UNIQUE_VIOLATION) {
+      lastError = error.message;
+    } else {
+      return { success: false, error: error.message };
+    }
   }
 
-  const property = data as Property;
-
-  // Generate and persist the URL slug now that we have the row id
-  const slug = generateSlug(property.title, property.city, property.id);
-  const { error: slugErr } = await supabase
-    .from('properties')
-    .update({ slug })
-    .eq('id', property.id);
-
-  if (!slugErr) {
-    property.slug = slug;
-  } else {
-    console.error('[createProperty] Failed to set slug:', slugErr.message);
+  if (!property) {
+    return { success: false, error: lastError ?? 'Could not allocate a unique listing slug' };
   }
 
   await Promise.all([
@@ -403,8 +487,19 @@ export async function updateProperty(
     if (amenityError) return { success: false, error: amenityError };
   }
 
+  // Enforce the shared guest-capacity range on update (#944).
+  if (payload.max_guests !== undefined) {
+    const guestError = validateMaxGuests(payload.max_guests);
+    if (guestError) {
+      return { success: false, error: guestError, statusCode: 400, field: 'max_guests' };
+    }
+  }
+
   // Sanitize user-generated text fields before storing
-  const sanitized: Partial<Property> = { ...payload };
+  // The slug is server-owned and immutable once set (migration 00072). Drop any
+  // client-supplied value rather than letting the write fail.
+  const { slug: _clientSlug, ...payloadWithoutSlug } = payload;
+  const sanitized: Partial<Property> = { ...payloadWithoutSlug };
   if (payload.title !== undefined) {
     sanitized.title = sanitizeShortText(payload.title, 255);
   }
@@ -509,36 +604,130 @@ const SAVED_SEARCH_MATCH_FIELDS = [
 
 /**
  * Soft-delete a property record by setting `deleted_at` to the current
- * timestamp.  The row is preserved in the database so that historical bookings,
- * reviews, and on-chain references continue to resolve correctly.
+ * timestamp. The row is preserved so historical bookings, reviews and on-chain
+ * references continue to resolve. Lifecycle rules: docs/listing-lifecycle.md.
  *
- * The listing is immediately hidden from all public reads and cannot receive
- * new bookings after this call returns.
+ * Rules enforced here:
+ *  - When `actor` is supplied (every HTTP caller), only the listing owner or an
+ *    administrator may delete it.
+ *  - A listing with reservations that still have unfinished obligations
+ *    (Pending, Confirmed or Disputed, with check-out not yet passed) cannot be
+ *    deleted. Returns code PROPERTY_HAS_ACTIVE_BOOKINGS (409).
+ *  - Deletion is idempotent: deleting an already-deleted listing succeeds.
  *
- * @param id - UUID of the property row to soft-delete.
+ * The active-booking check runs again after the tombstone is written. If a
+ * booking slipped in between the check and the write, the tombstone is rolled
+ * back so the guest's reservation is never left on a hidden listing.
+ *
+ * @param id    - UUID of the property row to soft-delete.
+ * @param actor - Authenticated caller. Omit only for trusted internal callers.
  */
-export async function deleteProperty(id: string): Promise<ServiceResponse<void>> {
+export async function deleteProperty(
+  id: string,
+  actor?: { id: string; role?: string },
+): Promise<ServiceResponse<void>> {
   if (!id) {
     return { success: false, error: 'Property ID is required' };
   }
 
+  const { data: current, error: readError } = await supabase
+    .from('properties')
+    .select('id, owner_id, deleted_at')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (readError) {
+    return { success: false, error: readError.message };
+  }
+  if (!current) {
+    return { success: false, error: 'Property not found', statusCode: 404 };
+  }
+
+  const row = current as { owner_id: string; deleted_at: string | null };
+  if (row.deleted_at) {
+    return { success: true };
+  }
+
+  if (actor && actor.id !== row.owner_id && actor.role !== 'admin') {
+    return {
+      success: false,
+      error: 'Forbidden: only the property owner or an administrator can delete this listing',
+      statusCode: 403,
+    };
+  }
+
+  const before = await findActiveReservations(id);
+  if (!before.success) return { success: false, error: before.error };
+  if (before.data!.length > 0) return activeBookingsRefusal();
+
+  const deletedAt = new Date().toISOString();
   const { error } = await supabase
     .from('properties')
-    .update({ deleted_at: new Date().toISOString() })
+    .update({ deleted_at: deletedAt })
     .eq('id', id)
-    .is('deleted_at', null); // idempotent: only update if not already deleted
+    .is('deleted_at', null);
 
   if (error) {
     return { success: false, error: error.message };
   }
 
+  // Re-check now that the tombstone is visible to booking writes. A reservation
+  // created in the gap is rolled back rather than left on a hidden listing.
+  const after = await findActiveReservations(id);
+  if (!after.success || after.data!.length > 0) {
+    await supabase
+      .from('properties')
+      .update({ deleted_at: null })
+      .eq('id', id)
+      .eq('deleted_at', deletedAt);
+    if (!after.success) return { success: false, error: after.error };
+    return activeBookingsRefusal();
+  }
+
+  await invalidatePropertyCaches(id);
+  return { success: true };
+}
+
+/** Bookings on a listing that still have unfinished obligations. */
+async function findActiveReservations(
+  propertyId: string,
+): Promise<ServiceResponse<Array<{ id: string }>>> {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await supabase
+    .from('bookings')
+    .select('id')
+    .eq('property_id', propertyId)
+    .in('status', [...ACTIVE_BOOKING_STATUSES])
+    .gte('check_out', today)
+    .limit(1);
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: (data ?? []) as Array<{ id: string }> };
+}
+
+function activeBookingsRefusal(): ServiceResponse<void> {
+  return {
+    success: false,
+    error: 'Cannot delete a listing with active bookings. Cancel or complete them first.',
+    statusCode: 409,
+    conflict: true,
+    code: 'PROPERTY_HAS_ACTIVE_BOOKINGS',
+  };
+}
+
+/** Clear every cache entry that can still serve a deleted listing. */
+async function invalidatePropertyCaches(propertyId: string): Promise<void> {
   await Promise.all([
-    cache.del(`property:${id}`),
+    cache.del(`property:${propertyId}`),
     cache.del('properties:all'),
     cache.del('properties:featured'),
+    // Featured results are cached per cap (properties:featured:<n>), which the
+    // bare key above does not reach. Without this a deleted listing can stay
+    // featured until the TTL expires.
+    ...Array.from({ length: FEATURED_CAP }, (_, i) =>
+      cache.del(`properties:featured:${i + 1}`),
+    ),
   ]);
-
-  return { success: true };
 }
 
 /**
@@ -821,6 +1010,31 @@ export async function advancedSearch(
     if (cached) return { success: true, data: cached };
   }
 
+  // Validate the requested guest count up front so search and booking agree on
+  // the same range (#944). An out-of-range value fails explicitly rather than
+  // silently returning no results.
+  if (filters.guests !== undefined) {
+    if (typeof filters.guests !== 'number' || !Number.isInteger(filters.guests)) {
+      return { success: false, error: 'guests must be an integer', statusCode: 400, field: 'guests' };
+    }
+    if (filters.guests < MIN_GUESTS) {
+      return {
+        success: false,
+        error: `guests must be at least ${MIN_GUESTS}`,
+        statusCode: 400,
+        field: 'guests',
+      };
+    }
+    if (filters.guests > MAX_GUESTS) {
+      return {
+        success: false,
+        error: `guests must be at most ${MAX_GUESTS}`,
+        statusCode: 400,
+        field: 'guests',
+      };
+    }
+  }
+
   const limit = Math.min(filters.limit || 20, 100);
   const page = Math.max(filters.page || 1, 1);
 
@@ -887,27 +1101,27 @@ export async function advancedSearch(
         .lte('longitude', east);
     }
 
-  // Bathroom filter (minimum bathrooms)
-  if (filters.min_bathrooms !== undefined) query = query.gte('bathrooms', filters.min_bathrooms);
+    // Bathroom filter (minimum bathrooms)
+    if (filters.min_bathrooms !== undefined) q = q.gte('bathrooms', filters.min_bathrooms);
 
-  // Property type filter (set membership — OR across supplied values)
-  if (filters.property_types && filters.property_types.length > 0) {
-    // Supabase .in() generates a SQL `column IN (v1, v2, ...)` clause which
-    // uses the idx_properties_property_type index on low-cardinality values.
-    query = query.in('property_type', filters.property_types);
-  } else if (filters.property_type) {
-    // Single-value convenience path (from simple searchProperties call)
-    query = query.eq('property_type', filters.property_type);
-  }
-
-  // Guest capacity
-  if (filters.guests !== undefined) query = query.gte('max_guests', filters.guests);
+    // Property type filter (set membership — OR across supplied values)
+    if (filters.property_types && filters.property_types.length > 0) {
+      // Supabase .in() generates a SQL `column IN (v1, v2, ...)` clause which
+      // uses the idx_properties_property_type index on low-cardinality values.
+      q = q.in('property_type', filters.property_types);
+    } else if (filters.property_type) {
+      // Single-value convenience path (from simple searchProperties call)
+      q = q.eq('property_type', filters.property_type);
+    }
 
     // Bedroom filter
     if (filters.bedrooms !== undefined) q = q.gte('bedrooms', filters.bedrooms);
 
-    // Guest capacity
-    if (filters.guests !== undefined) q = q.gte('max_guests', filters.guests);
+    // Guest capacity — must match the booking rule (#944). A listing qualifies
+    // only when its stored capacity is at least the requested guest count.
+    if (filters.guests !== undefined) {
+      q = q.gte('max_guests', filters.guests);
+    }
 
     // Amenities — must contain all requested amenities
     if (filters.amenities && filters.amenities.length > 0) {
@@ -1332,8 +1546,22 @@ function hasValue(value: unknown): boolean {
  * @returns An error message for the first invalid field, or null when valid.
  */
 function validateDraftPatch(patch: Partial<Property>): string | null {
+  // Autosave accepts partial input, so minimum lengths are checked at step advance and submit.
+  // Maximums and formats must hold on every write, to match the create schema (#920).
   if (patch.title !== undefined && (typeof patch.title !== 'string' || patch.title.trim() === '')) {
     return 'title must be a non-empty string';
+  }
+  if (typeof patch.title === 'string' && patch.title.trim().length > 100) {
+    return 'title must be at most 100 characters';
+  }
+  if (typeof patch.description === 'string' && patch.description.trim().length > 2000) {
+    return 'description must be at most 2000 characters';
+  }
+  for (const field of ['check_in_time', 'check_out_time'] as const) {
+    const value = (patch as Record<string, unknown>)[field];
+    if (value !== undefined && value !== null && (typeof value !== 'string' || !/^\d{2}:\d{2}$/.test(value))) {
+      return `${field} must be in HH:MM format`;
+    }
   }
   if (patch.price_per_night !== undefined && (typeof patch.price_per_night !== 'number' || !(patch.price_per_night > 0))) {
     return 'price_per_night must be a positive number';
@@ -1344,8 +1572,9 @@ function validateDraftPatch(patch: Partial<Property>): string | null {
       return `${field} must be a non-negative integer`;
     }
   }
-  if (patch.max_guests !== undefined && (typeof patch.max_guests !== 'number' || !Number.isInteger(patch.max_guests) || patch.max_guests < 1)) {
-    return 'max_guests must be a positive integer';
+  if (patch.max_guests !== undefined) {
+    const guestError = validateMaxGuests(patch.max_guests);
+    if (guestError) return guestError;
   }
   if (patch.min_nights !== undefined && (typeof patch.min_nights !== 'number' || !Number.isInteger(patch.min_nights) || patch.min_nights < 1)) {
     return 'min_nights must be a positive integer';
@@ -1513,10 +1742,12 @@ export async function publishDraft(
     return { success: false, error: 'Only drafts can be published', statusCode: 409 };
   }
 
+  // Pending images count toward readiness; rejected and removed ones do not (#922).
   const { count: imageCount } = await supabase
     .from('property_images')
     .select('id', { count: 'exact', head: true })
-    .eq('property_id', propertyId);
+    .eq('property_id', propertyId)
+    .in('moderation_status', ['pending', 'approved']);
 
   const readiness = getPublishReadiness(row, imageCount ?? 0);
   if (!readiness.ready) {
